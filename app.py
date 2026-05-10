@@ -1,144 +1,178 @@
 # app.py
-# Giao diện tiếng Việt: tạo danh mục mẫu + backtest + cập nhật giá qua vnstock
-# Dữ liệu model/artifact sẽ được tải từ Google Drive (public file ID) hoặc từ file local trong repo.
+# VN Stock Dashboard + Roboadvisor + LONG Screener
+# Nguồn dữ liệu: folder Google Drive "Khoaluan"
+# Giao diện 100% tiếng Việt
 
 import os
 import json
 import tempfile
 from pathlib import Path
+from datetime import date, timedelta
 
-import joblib
 import gdown
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.cluster import KMeans
 from vnstock import Quote
 
 # =========================================================
 # PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Cố vấn danh mục & Long Screener",
+    page_title="Cố vấn danh mục & LONG Screener",
     page_icon="📈",
     layout="wide",
 )
 
 st.title("🇻🇳 Cố vấn danh mục cổ phiếu Việt Nam")
 st.caption(
-    "Kết hợp danh mục mẫu cho nhà đầu tư, backtest so với VNINDEX và bộ tín hiệu LONG đã huấn luyện."
+    "Tạo danh mục mẫu, backtest so với VNINDEX, cập nhật giá mỗi ngày, "
+    "và chấm điểm LONG theo mô hình đã huấn luyện."
 )
 
 # =========================================================
 # CONFIG
 # =========================================================
-def cfg(name: str, default: str = "") -> str:
-    """Đọc từ Streamlit secrets trước, nếu không có thì đọc từ env var."""
+def get_cfg(key: str, default: str = "") -> str:
     try:
-        return st.secrets[name]
+        return st.secrets.get(key, default)
     except Exception:
-        return os.getenv(name, default)
+        return os.getenv(key, default)
 
+KHOALUAN_FOLDER_URL = get_cfg(
+    "KHOALUAN_FOLDER_URL",
+    "https://drive.google.com/drive/folders/1VcKf2mWjmeiN16kpj25I7zrbPhxlXmqg?usp=sharing",
+)
 
-ASSET_IDS = {
-    # dữ liệu gốc cho danh mục mẫu
-    "price_aligned_copy.csv": cfg("PRICE_ALIGNED_COPY_ID"),
-    # artifact của mô hình LONG
-    "long_model.pkl": cfg("LONG_MODEL_ID"),
-    "feature_cols.pkl": cfg("FEATURE_COLS_ID"),
-    "metadata.json": cfg("METADATA_ID"),
-
-    # output đã lưu từ Colab
-    "ml_df.csv": cfg("ML_DF_ID"),
-    "walk_forward_df.csv": cfg("WALK_FORWARD_DF_ID"),
-    "wf_oos_predictions.csv": cfg("WF_OOS_PRED_ID"),
-    "latest_top30_predictions.csv": cfg("LATEST_TOP30_ID"),
-    "oos_decile_performance.csv": cfg("DECILE_PERF_ID"),
-    "walk_forward_summary.csv": cfg("WF_SUMMARY_ID"),
-    "long_model_feature_importance.csv": cfg("FEATURE_IMPORTANCE_ID"),
-    "feature_future_return_correlation.csv": cfg("FEATURE_CORR_ID"),
-    "oos_topk_backtest_vs_vnindex.csv": cfg("BACKTEST_ID"),
-    "regime_filtered_oos_topk_backtest_vs_vnindex.csv": cfg("REGIME_BACKTEST_ID"),
-}
-
-CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_assets"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-VNSTOCK_PRIMARY_SOURCE = cfg("VNSTOCK_SOURCE", "KBS")
+VNSTOCK_PRIMARY_SOURCE = get_cfg("VNSTOCK_SOURCE", "KBS")
 VNSTOCK_FALLBACK_SOURCE = "VCI" if VNSTOCK_PRIMARY_SOURCE == "KBS" else "KBS"
 
+CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_drive_mirror"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+REQUIRED_FILES = [
+    "models/long_model.pkl",
+    "models/feature_cols.pkl",
+    "data/price_aligned_copy.csv",
+    "metadata/metadata.json",
+]
+
+OPTIONAL_FILES = [
+    "data/ml_df.csv",
+    "data/walk_forward_df.csv",
+    "predictions/wf_oos_predictions.csv",
+    "predictions/latest_top30_predictions.csv",
+    "results/oos_decile_performance.csv",
+    "results/walk_forward_summary.csv",
+    "results/long_model_feature_importance.csv",
+    "results/feature_future_return_correlation.csv",
+    "backtest/oos_topk_backtest_vs_vnindex.csv",
+    "backtest/regime_filtered_oos_topk_backtest_vs_vnindex.csv",
+]
+
 # =========================================================
-# HELPERS: DOWNLOAD / LOAD ARTIFACTS
+# HELPERS: DRIVE SYNC
 # =========================================================
-def download_from_drive(file_id: str, filename: str) -> Path | None:
-    if not file_id:
-        return None
-    out_path = CACHE_DIR / filename
-    if out_path.exists():
-        return out_path
-    url = f"https://drive.google.com/uc?id={file_id}"
-    gdown.download(url, str(out_path), quiet=True)
-    return out_path if out_path.exists() else None
+@st.cache_resource(show_spinner=False)
+def sync_drive_folder() -> Path:
+    marker = CACHE_DIR / ".synced"
+    if marker.exists():
+        return CACHE_DIR
+
+    if not KHOALUAN_FOLDER_URL.strip():
+        return CACHE_DIR
+
+    gdown.download_folder(
+        url=KHOALUAN_FOLDER_URL.strip(),
+        output=str(CACHE_DIR),
+        quiet=True,
+    )
+    marker.write_text("ok", encoding="utf-8")
+    return CACHE_DIR
 
 
-def resolve_artifact(filename: str) -> Path | None:
-    """Ưu tiên file local/repo, sau đó mới tải từ Drive."""
+def resolve_artifact(rel_path: str) -> Path | None:
+    """
+    Tìm file theo:
+    1) local repo
+    2) folder mirror từ Drive
+    """
     candidates = [
-        Path(filename),
-        Path("data") / filename,
-        Path("models") / filename,
-        Path("results") / filename,
-        Path("predictions") / filename,
-        Path("backtest") / filename,
-        Path("metadata") / filename,
+        Path(rel_path),
+        Path("data") / rel_path,
+        Path("models") / rel_path,
+        Path("results") / rel_path,
+        Path("predictions") / rel_path,
+        Path("backtest") / rel_path,
+        Path("metadata") / rel_path,
     ]
     for p in candidates:
         if p.exists():
             return p
 
-    file_id = ASSET_IDS.get(filename, "")
-    return download_from_drive(file_id, filename)
+    root = sync_drive_folder()
+
+    direct = root / rel_path
+    if direct.exists():
+        return direct
+
+    matches = list(root.rglob(Path(rel_path).name))
+    if matches:
+        return matches[0]
+
+    return None
+
+
+def check_required_files():
+    missing = [p for p in REQUIRED_FILES if resolve_artifact(p) is None]
+    return missing
 
 
 @st.cache_data(show_spinner=False)
-def load_csv_asset(filename: str) -> pd.DataFrame | None:
-    path = resolve_artifact(filename)
-    if path is None:
+def load_csv_asset(rel_path: str) -> pd.DataFrame | None:
+    p = resolve_artifact(rel_path)
+    if p is None:
         return None
-    return pd.read_csv(path, low_memory=False)
+    return pd.read_csv(p, low_memory=False)
 
 
 @st.cache_data(show_spinner=False)
-def load_json_asset(filename: str) -> dict | None:
-    path = resolve_artifact(filename)
-    if path is None:
+def load_json_asset(rel_path: str) -> dict | None:
+    p = resolve_artifact(rel_path)
+    if p is None:
         return None
-    with open(path, "r", encoding="utf-8") as f:
+    with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 @st.cache_resource(show_spinner=False)
-def load_pickle_asset(filename: str):
-    path = resolve_artifact(filename)
-    if path is None:
+def load_pickle_asset(rel_path: str):
+    p = resolve_artifact(rel_path)
+    if p is None:
         return None
-    return joblib.load(path)
+    return joblib.load(p)
 
 
+# =========================================================
+# HELPERS: PRICE MATRIX
+# =========================================================
 @st.cache_data(show_spinner=False)
 def load_price_wide() -> pd.DataFrame:
     """
-    File price_aligned_copy.csv là wide:
+    price_aligned_copy.csv là wide:
     time, ticker1, ticker2, ..., VNINDEX
     """
-    path = resolve_artifact("price_aligned_copy.csv")
-    if path is None:
+    p = resolve_artifact("data/price_aligned_copy.csv")
+    if p is None:
         raise FileNotFoundError(
-            "Không tìm thấy price_aligned_copy.csv. Hãy tạo public file ID hoặc để file trong repo."
+            "Không tìm thấy data/price_aligned_copy.csv trong repo hoặc folder Khoaluan."
         )
 
-    df = pd.read_csv(path, low_memory=False)
+    df = pd.read_csv(p, low_memory=False)
     df.columns = [str(c).strip() for c in df.columns]
 
     if "time" not in df.columns:
@@ -167,15 +201,12 @@ def build_returns(price_wide: pd.DataFrame) -> pd.DataFrame:
 # =========================================================
 # HELPERS: VNSTOCK LIVE UPDATE
 # =========================================================
-def fetch_latest_close_vnstock(ticker: str) -> dict | None:
-    """
-    Kéo giá daily mới nhất bằng vnstock.
-    Ưu tiên source KBS, nếu lỗi thì fallback VCI.
-    """
-    for source in [VNSTOCK_PRIMARY_SOURCE, VNSTOCK_FALLBACK_SOURCE]:
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_ohlc_history(ticker: str, start_date: str, end_date: str, source: str = "KBS") -> pd.DataFrame | None:
+    for src in [source, VNSTOCK_FALLBACK_SOURCE]:
         try:
-            q = Quote(symbol=ticker, source=source)
-            hist = q.history(length="5", interval="d")
+            q = Quote(symbol=ticker, source=src)
+            hist = q.history(start=start_date, end=end_date, interval="d")
 
             if hist is None or hist.empty:
                 continue
@@ -183,30 +214,52 @@ def fetch_latest_close_vnstock(ticker: str) -> dict | None:
             hist = hist.copy()
             hist.columns = [str(c).strip().lower() for c in hist.columns]
 
-            date_col = "time" if "time" in hist.columns else "date"
-            close_col = "close" if "close" in hist.columns else None
-            if close_col is None:
-                continue
+            if "time" in hist.columns:
+                hist = hist.rename(columns={"time": "date"})
+            elif "date" not in hist.columns:
+                hist = hist.rename(columns={hist.columns[0]: "date"})
 
-            last = hist.iloc[-1]
-            return {
-                "ticker": ticker,
-                "date": pd.to_datetime(last[date_col], errors="coerce"),
-                "close": float(last[close_col]),
-                "source": source,
-            }
+            if "ticker" not in hist.columns:
+                hist["ticker"] = ticker
+
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in hist.columns:
+                    hist[c] = pd.to_numeric(hist[c], errors="coerce")
+
+            hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+            hist = hist.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+            hist["ticker"] = ticker
+
+            return hist
+
         except Exception:
             continue
+
     return None
 
 
-def merge_live_updates_into_price_wide(
-    price_wide: pd.DataFrame, updates: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Cập nhật giá cuối ngày vào matrix wide.
-    Nếu ngày mới chưa có thì append row mới.
-    """
+def fetch_latest_close_vnstock(ticker: str, source: str = "KBS") -> dict | None:
+    end_dt = date.today()
+    start_dt = end_dt - timedelta(days=15)
+    hist = fetch_ohlc_history(
+        ticker=ticker,
+        start_date=start_dt.strftime("%Y-%m-%d"),
+        end_date=end_dt.strftime("%Y-%m-%d"),
+        source=source,
+    )
+    if hist is None or hist.empty:
+        return None
+
+    last = hist.iloc[-1]
+    return {
+        "ticker": ticker,
+        "date": pd.to_datetime(last["date"], errors="coerce"),
+        "close": float(last["close"]),
+        "source": source,
+    }
+
+
+def merge_live_updates_into_price_wide(price_wide: pd.DataFrame, updates: pd.DataFrame) -> pd.DataFrame:
     if updates is None or updates.empty:
         return price_wide
 
@@ -217,7 +270,6 @@ def merge_live_updates_into_price_wide(
 
     latest_date = updates["date"].max()
 
-    # đảm bảo cột ticker tồn tại
     for tk in updates["ticker"].unique():
         if tk not in out.columns:
             out[tk] = np.nan
@@ -237,7 +289,7 @@ def merge_live_updates_into_price_wide(
 
 
 # =========================================================
-# HELPERS: PORTFOLIO ENGINE (TỪ NOTEBOOK "DANH MỤC TEST")
+# HELPERS: NOTEBOOK "DANH MỤC TEST"
 # =========================================================
 def build_universe(price_wide: pd.DataFrame, returns_wide: pd.DataFrame) -> pd.DataFrame:
     market_col = "VNINDEX" if "VNINDEX" in price_wide.columns else None
@@ -246,8 +298,6 @@ def build_universe(price_wide: pd.DataFrame, returns_wide: pd.DataFrame) -> pd.D
     TRADING_DAYS = 252
     mu = returns_wide[stock_cols].mean() * TRADING_DAYS
     vol = returns_wide[stock_cols].std() * np.sqrt(TRADING_DAYS)
-
-    # giữ đúng logic notebook: price * 1000
     latest_price = price_wide[stock_cols].iloc[-1] * 1000
 
     universe = pd.DataFrame(
@@ -288,18 +338,25 @@ def construct_portfolio(
 
     filtered = universe[positive_mask & vol_mask & price_mask].copy()
 
+    growth_pool = filtered.sort_values("mean_return", ascending=False).head(30).copy()
+    defensive_pool = filtered.sort_values("volatility", ascending=True).head(30).copy()
+
     if filtered.empty:
-        return profile, filtered, pd.DataFrame(), pd.DataFrame(), {
-            "vol_cutoff": vol_cutoff,
+        stats = {
             "profile": profile,
             "growth_weight": growth_weight,
             "defensive_weight": defensive_weight,
             "n_stocks": n_stocks,
             "max_weight": max_weight,
+            "vol_cutoff": vol_cutoff,
+            "expected_return": np.nan,
+            "expected_risk": np.nan,
+            "return_risk": np.nan,
+            "target_return": target_return,
+            "horizon_month": horizon_month,
+            "capital": capital,
         }
-
-    growth_pool = filtered.sort_values("mean_return", ascending=False).head(30).copy()
-    defensive_pool = filtered.sort_values("volatility", ascending=True).head(30).copy()
+        return profile, filtered, growth_pool, defensive_pool, pd.DataFrame(), stats
 
     n_growth = n_stocks // 2
     n_def = n_stocks - n_growth
@@ -314,14 +371,21 @@ def construct_portfolio(
     portfolio = portfolio[~portfolio.index.duplicated()].copy()
 
     if portfolio.empty:
-        return profile, filtered, growth_pool, defensive_pool, {
-            "vol_cutoff": vol_cutoff,
+        stats = {
             "profile": profile,
             "growth_weight": growth_weight,
             "defensive_weight": defensive_weight,
             "n_stocks": n_stocks,
             "max_weight": max_weight,
+            "vol_cutoff": vol_cutoff,
+            "expected_return": np.nan,
+            "expected_risk": np.nan,
+            "return_risk": np.nan,
+            "target_return": target_return,
+            "horizon_month": horizon_month,
+            "capital": capital,
         }
+        return profile, filtered, growth_pool, defensive_pool, portfolio, stats
 
     portfolio["raw_weight"] = portfolio["score"] / portfolio["score"].sum()
     portfolio["weight"] = portfolio["raw_weight"].clip(upper=max_weight)
@@ -350,11 +414,7 @@ def construct_portfolio(
     return profile, filtered, growth_pool, defensive_pool, portfolio, stats
 
 
-def backtest_portfolio(
-    price_wide: pd.DataFrame,
-    returns_wide: pd.DataFrame,
-    portfolio: pd.DataFrame,
-):
+def backtest_portfolio(price_wide: pd.DataFrame, returns_wide: pd.DataFrame, portfolio: pd.DataFrame):
     selected = portfolio.index.tolist()
     weights = portfolio["weight"].values
 
@@ -362,8 +422,8 @@ def backtest_portfolio(
     benchmark = returns_wide["VNINDEX"] if "VNINDEX" in returns_wide.columns else None
 
     portfolio_nav = (1 + port_ret_series).cumprod()
-
     result = pd.DataFrame({"Portfolio": portfolio_nav})
+
     if benchmark is not None:
         vnindex_nav = (1 + benchmark).cumprod()
         result["VNINDEX"] = vnindex_nav
@@ -392,11 +452,12 @@ def backtest_portfolio(
                 "vn_sharpe": vn_sharpe,
             }
         )
+
     return out
 
 
-def make_price_overlay(df: pd.DataFrame):
-    d = df.copy()
+def make_price_overlay(d: pd.DataFrame):
+    d = d.copy()
     d["MA20"] = d["close"].rolling(20).mean()
     d["MA50"] = d["close"].rolling(50).mean()
 
@@ -412,11 +473,268 @@ def make_price_overlay(df: pd.DataFrame):
 
 
 # =========================================================
-# LOAD SESSION DATA
+# HELPERS: LONG FEATURE ENGINE (LIVE SCORES)
 # =========================================================
-with st.spinner("Đang tải dữ liệu gốc từ Drive / repo..."):
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period, min_periods=period).mean()
+    avg_loss = loss.rolling(period, min_periods=period).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(series):
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - signal
+    return macd, signal, hist
+
+
+def compute_bbands(series, window=20):
+    ma = series.rolling(window, min_periods=window).mean()
+    std = series.rolling(window, min_periods=window).std()
+    return ma + 2 * std, ma - 2 * std
+
+
+def classify_regime_value(r, ma20, ma50):
+    if pd.isna(r):
+        return "UNKNOWN"
+    if r < -0.10:
+        return "BEAR"
+    if (r > 0.12) and (ma20 > ma50):
+        return "BULL_STRONG"
+    if r > 0.03:
+        return "BULL"
+    return "SIDEWAY"
+
+
+def smooth_regime(regimes, win=10):
+    smooth = []
+    for i in range(len(regimes)):
+        window = regimes[max(0, i - win + 1) : i + 1]
+        mode_val = pd.Series(window).mode()
+        if len(mode_val) > 0:
+            smooth.append(mode_val.iloc[0])
+        else:
+            smooth.append("SIDEWAY")
+    return smooth
+
+
+def detect_fractals(temp):
+    lows = temp["low"].values
+    highs = temp["high"].values
+
+    if "volume" in temp.columns and temp["volume"].notna().any():
+        vol = temp["volume"].fillna(0).values
+    else:
+        vol = temp["RET"].abs().fillna(0).values
+
+    support_points = []
+    resistance_points = []
+    vol_mean_20 = pd.Series(vol).rolling(20, min_periods=10).mean().values
+
+    for i in range(2, len(temp) - 2):
+        if (
+            lows[i] < lows[i - 1]
+            and lows[i] < lows[i - 2]
+            and lows[i] < lows[i + 1]
+            and lows[i] < lows[i + 2]
+        ):
+            if i < len(vol_mean_20) and vol[i] >= vol_mean_20[i]:
+                support_points.append(lows[i])
+
+        if (
+            highs[i] > highs[i - 1]
+            and highs[i] > highs[i - 2]
+            and highs[i] > highs[i + 1]
+            and highs[i] > highs[i + 2]
+        ):
+            if i < len(vol_mean_20) and vol[i] >= vol_mean_20[i]:
+                resistance_points.append(highs[i])
+
+    return np.array(support_points), np.array(resistance_points)
+
+
+def cluster_levels(levels, max_k=4):
+    levels = np.array(levels)
+    if len(levels) == 0:
+        return []
+
+    levels = levels.reshape(-1, 1)
+    k = min(max_k, len(levels))
+
+    if k <= 1:
+        return sorted(levels.flatten().tolist())
+
+    try:
+        model = KMeans(n_clusters=k, n_init=10, random_state=42)
+        model.fit(levels)
+        return sorted(model.cluster_centers_.flatten().tolist())
+    except Exception:
+        return sorted(levels.flatten().tolist())
+
+
+def build_live_features(ohlc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tái tạo gần nhất pipeline feature từ notebook LONG cho một mã.
+    """
+    temp = ohlc.copy().sort_values("date").reset_index(drop=True)
+
+    # đảm bảo cột
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in temp.columns:
+            temp[c] = temp["close"]
+
+    temp["RET"] = temp["close"].pct_change()
+    temp["RSI14"] = compute_rsi(temp["close"])
+    temp["MACD"], temp["MACD_signal"], temp["MACD_hist"] = compute_macd(temp["close"])
+    temp["BB_upper"], temp["BB_lower"] = compute_bbands(temp["close"])
+    temp["MA20"] = temp["close"].rolling(20, min_periods=20).mean()
+    temp["MA50"] = temp["close"].rolling(50, min_periods=50).mean()
+    temp["MA100"] = temp["close"].rolling(100, min_periods=100).mean()
+    temp["Volatility20"] = temp["RET"].rolling(20, min_periods=20).std()
+
+    hl = temp["high"] - temp["low"]
+    hc = (temp["high"] - temp["close"].shift()).abs()
+    lc = (temp["low"] - temp["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    temp["ATR14"] = tr.rolling(14, min_periods=14).mean()
+
+    temp["RollingRet60"] = temp["close"].pct_change(60)
+    temp["Trend_MA20_vs_50"] = temp["MA20"] - temp["MA50"]
+    temp["Trend_MA50_vs_100"] = temp["MA50"] - temp["MA100"]
+
+    temp["Regime_raw"] = temp.apply(
+        lambda row: classify_regime_value(row["RollingRet60"], row["MA20"], row["MA50"]),
+        axis=1,
+    )
+    temp["Regime"] = smooth_regime(temp["Regime_raw"].values)
+
+    supports, resistances = detect_fractals(temp)
+
+    if len(supports) < 2:
+        supports = temp["close"].rolling(60, min_periods=30).min().dropna().values
+    if len(resistances) < 2:
+        resistances = temp["close"].rolling(60, min_periods=30).max().dropna().values
+    if len(supports) == 0:
+        supports = np.array([temp["close"].min()])
+    if len(resistances) == 0:
+        resistances = np.array([temp["close"].max()])
+
+    support_levels = cluster_levels(supports)
+    resistance_levels = cluster_levels(resistances)
+
+    dist_sup = []
+    dist_res = []
+
+    for price in temp["close"]:
+        below = [s for s in support_levels if s <= price]
+        above = [r for r in resistance_levels if r >= price]
+
+        if below:
+            dist_sup.append((price - max(below)) / price)
+        else:
+            dist_sup.append(np.nan)
+
+        if above:
+            dist_res.append((min(above) - price) / price)
+        else:
+            dist_res.append(np.nan)
+
+    temp["dist_support"] = pd.Series(dist_sup, index=temp.index).bfill().ffill().fillna(0)
+    temp["dist_resistance"] = pd.Series(dist_res, index=temp.index).ffill().bfill().fillna(0)
+
+    # Mother structure
+    temp["MA200"] = temp["close"].rolling(200, min_periods=150).mean()
+    temp["High250"] = temp["close"].rolling(250, min_periods=200).max()
+    temp["Low250"] = temp["close"].rolling(250, min_periods=200).min()
+
+    temp["Above_MA100"] = (temp["close"] > temp["MA100"]).astype(int)
+    temp["Below_MA100"] = (temp["close"] < temp["MA100"]).astype(int)
+    temp["MajorBreakout"] = (temp["close"] >= temp["High250"]).astype(int)
+    temp["MajorBreakdown"] = (temp["close"] <= temp["Low250"]).astype(int)
+
+    temp["MotherBull"] = (
+        ((temp["Above_MA100"] == 1) & (temp["Regime"].isin(["BULL", "BULL_STRONG"])))
+        | (temp["MajorBreakout"] == 1)
+    ).astype(int)
+
+    temp["MotherBear"] = (
+        ((temp["Below_MA100"] == 1) & (temp["Regime"] == "BEAR"))
+        | (temp["MajorBreakdown"] == 1)
+    ).astype(int)
+
+    temp = temp.dropna().copy()
+    return temp
+
+
+def score_long_ticker(ticker: str, history_days: int = 420, source: str = "KBS"):
+    if long_model is None or feature_cols is None:
+        return None
+
+    end_dt = date.today()
+    start_dt = end_dt - timedelta(days=max(600, history_days))
+
+    ohlc = fetch_ohlc_history(
+        ticker=ticker,
+        start_date=start_dt.strftime("%Y-%m-%d"),
+        end_date=end_dt.strftime("%Y-%m-%d"),
+        source=source,
+    )
+    if ohlc is None or ohlc.empty:
+        return None
+
+    feat = build_live_features(ohlc)
+    if feat.empty:
+        return None
+
+    latest = feat.iloc[-1:].copy()
+
+    for c in feature_cols:
+        if c not in latest.columns:
+            latest[c] = np.nan
+
+    latest = latest.dropna(subset=feature_cols)
+    if latest.empty:
+        return None
+
+    prob = float(long_model.predict_proba(latest[feature_cols])[:, 1][0])
+
+    if prob >= 0.80:
+        signal = "MUA MẠNH"
+    elif prob >= 0.60:
+        signal = "CHỜ MUA"
+    elif prob >= 0.40:
+        signal = "GIỮ"
+    else:
+        signal = "THẬN TRỌNG"
+
+    row = latest.iloc[0].to_dict()
+    row["ticker"] = ticker
+    row["long_probability"] = prob
+    row["signal"] = signal
+    row["history_rows"] = len(feat)
+
+    return row, feat
+
+
+# =========================================================
+# LOAD DATA / ARTIFACTS
+# =========================================================
+with st.spinner("Đang đồng bộ dữ liệu từ Google Drive / repo..."):
+    missing_required = check_required_files()
+    if missing_required:
+        st.error("Thiếu file bắt buộc trong folder Khoaluan:")
+        st.code("\n".join(missing_required))
+        st.stop()
+
     price_wide_base = load_price_wide()
 
+# session state for live updates
 if "price_wide" not in st.session_state:
     st.session_state.price_wide = price_wide_base.copy()
     st.session_state.returns_wide = build_returns(st.session_state.price_wide)
@@ -428,26 +746,23 @@ ticker_list = [c for c in price_wide.columns if c != "VNINDEX"]
 date_min = price_wide.index.min()
 date_max = price_wide.index.max()
 
-# =========================================================
-# LOAD SAVED MODEL ARTIFACTS
-# =========================================================
-long_model = load_pickle_asset("long_model.pkl")
-feature_cols = load_pickle_asset("feature_cols.pkl")
-metadata = load_json_asset("metadata.json")
+long_model = load_pickle_asset("models/long_model.pkl")
+feature_cols = load_pickle_asset("models/feature_cols.pkl")
+metadata = load_json_asset("metadata/metadata.json")
 
-df_ml = load_csv_asset("ml_df.csv")
-df_wf = load_csv_asset("walk_forward_df.csv")
-df_oos = load_csv_asset("wf_oos_predictions.csv")
-df_latest_top = load_csv_asset("latest_top30_predictions.csv")
-df_decile = load_csv_asset("oos_decile_performance.csv")
-df_wf_summary = load_csv_asset("walk_forward_summary.csv")
-df_importance = load_csv_asset("long_model_feature_importance.csv")
-df_corr = load_csv_asset("feature_future_return_correlation.csv")
-df_backtest = load_csv_asset("oos_topk_backtest_vs_vnindex.csv")
-df_regime_backtest = load_csv_asset("regime_filtered_oos_topk_backtest_vs_vnindex.csv")
+df_ml = load_csv_asset("data/ml_df.csv")
+df_wf = load_csv_asset("data/walk_forward_df.csv")
+df_oos = load_csv_asset("predictions/wf_oos_predictions.csv")
+df_latest_top = load_csv_asset("predictions/latest_top30_predictions.csv")
+df_decile = load_csv_asset("results/oos_decile_performance.csv")
+df_wf_summary = load_csv_asset("results/walk_forward_summary.csv")
+df_importance = load_csv_asset("results/long_model_feature_importance.csv")
+df_corr = load_csv_asset("results/feature_future_return_correlation.csv")
+df_backtest = load_csv_asset("backtest/oos_topk_backtest_vs_vnindex.csv")
+df_regime_backtest = load_csv_asset("backtest/regime_filtered_oos_topk_backtest_vs_vnindex.csv")
 
 # =========================================================
-# SIDEBAR CONTROLS
+# SIDEBAR
 # =========================================================
 st.sidebar.header("Điều khiển")
 
@@ -465,21 +780,28 @@ capital = st.sidebar.number_input("Vốn đầu tư (VND)", min_value=1_000_000,
 vol_quantile = st.sidebar.slider("Ngưỡng volatility (quantile)", 0.50, 0.99, 0.90, 0.01)
 min_price = st.sidebar.number_input("Giá tối thiểu (VND)", min_value=0, value=5000, step=500)
 
+show_overlay = st.sidebar.checkbox("Hiển thị BUY/SELL overlay", value=True)
+
 update_mode = st.sidebar.radio(
     "Cập nhật giá bằng vnstock",
     ["Mã đang chọn", "Toàn bộ danh mục"],
 )
 
-source_choice = st.sidebar.selectbox(
-    "Nguồn vnstock",
-    [VNSTOCK_PRIMARY_SOURCE, VNSTOCK_FALLBACK_SOURCE],
-    index=0,
+update_benchmark = st.sidebar.checkbox("Cập nhật thêm VNINDEX", value=True)
+active_source = st.sidebar.selectbox("Nguồn vnstock", ["KBS", "VCI"], index=0 if VNSTOCK_PRIMARY_SOURCE == "KBS" else 1)
+
+history_days_input = st.sidebar.number_input(
+    "Số phiên lịch sử để chấm LONG",
+    min_value=260,
+    max_value=1200,
+    value=420,
+    step=20,
 )
 
 refresh_btn = st.sidebar.button("Cập nhật giá hôm nay", type="primary")
 
 st.sidebar.caption(
-    "Lưu ý: cập nhật bằng vnstock chỉ lưu trong phiên hiện tại của Streamlit Cloud. "
+    "Cập nhật qua vnstock chỉ lưu trong phiên hiện tại. "
     "Muốn lưu vĩnh viễn thì cần job đồng bộ riêng."
 )
 
@@ -487,7 +809,9 @@ st.sidebar.caption(
 # LIVE UPDATE ACTION
 # =========================================================
 if refresh_btn:
-    tickers_to_update = [selected_ticker] if update_mode == "Mã đang chọn" else ticker_list
+    tickers_to_update = [selected_ticker] if update_mode == "Mã đang chọn" else ticker_list[:]
+    if update_benchmark:
+        tickers_to_update = tickers_to_update + ["VNINDEX"]
 
     if len(tickers_to_update) == 0:
         st.sidebar.warning("Không có mã để cập nhật.")
@@ -495,7 +819,7 @@ if refresh_btn:
         progress = st.sidebar.progress(0)
         updates = []
         for i, tk in enumerate(tickers_to_update, start=1):
-            rec = fetch_latest_close_vnstock(tk)
+            rec = fetch_latest_close_vnstock(tk, source=active_source)
             if rec is not None:
                 updates.append(rec)
             progress.progress(i / len(tickers_to_update))
@@ -512,7 +836,7 @@ if refresh_btn:
         else:
             st.sidebar.error("Không lấy được giá mới từ vnstock.")
 
-# refresh local refs after possible update
+# refresh local refs after update
 price_wide = st.session_state.price_wide
 returns_wide = st.session_state.returns_wide
 
@@ -551,18 +875,20 @@ with tab1:
     st.write("### Bảng giá mẫu")
     st.dataframe(price_wide.reset_index().tail(10), use_container_width=True)
 
+    st.write("### Trạng thái file đã nạp")
+    rows = []
+    for fn in REQUIRED_FILES + OPTIONAL_FILES:
+        rows.append(
+            {
+                "file": fn,
+                "status": "Đã nạp" if resolve_artifact(fn) is not None else "Thiếu / tùy chọn",
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
     if metadata:
         st.write("### Metadata mô hình")
         st.json(metadata)
-
-    st.write("### Trạng thái file đã nạp từ Drive")
-    loaded_files = []
-    for fn in ASSET_IDS.keys():
-        if resolve_artifact(fn) is not None:
-            loaded_files.append({"file": fn, "status": "Đã nạp"})
-        else:
-            loaded_files.append({"file": fn, "status": "Thiếu / chưa cấu hình ID"})
-    st.dataframe(pd.DataFrame(loaded_files), use_container_width=True)
 
 # =========================================================
 # TAB 2 — PORTFOLIO CONSTRUCTION
@@ -589,17 +915,14 @@ with tab2:
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Vol cutoff", f"{stats.get('vol_cutoff', np.nan):.4f}")
-    c6.metric("Lợi nhuận kỳ vọng", f"{stats.get('expected_return', np.nan):.2%}")
-    c7.metric("Rủi ro kỳ vọng", f"{stats.get('expected_risk', np.nan):.2%}")
-    c8.metric("Return/Risk", f"{stats.get('return_risk', np.nan):.2f}")
+    c6.metric("Lợi nhuận kỳ vọng", f"{stats.get('expected_return', np.nan):.2%}" if pd.notna(stats.get("expected_return", np.nan)) else "N/A")
+    c7.metric("Rủi ro kỳ vọng", f"{stats.get('expected_risk', np.nan):.2%}" if pd.notna(stats.get("expected_risk", np.nan)) else "N/A")
+    c8.metric("Return/Risk", f"{stats.get('return_risk', np.nan):.2f}" if pd.notna(stats.get("return_risk", np.nan)) else "N/A")
 
-    st.write("### Universe sau khi lọc")
-    st.write(f"Số mã đủ điều kiện: **{len(filtered):,}**")
+    st.write(f"**Số mã đủ điều kiện:** {len(filtered):,}")
     if not filtered.empty:
-        st.dataframe(
-            filtered.sort_values("mean_return", ascending=False).head(20),
-            use_container_width=True,
-        )
+        st.write("### Universe sau khi lọc")
+        st.dataframe(filtered.sort_values("mean_return", ascending=False).head(20), use_container_width=True)
 
     if not growth_pool.empty and not defensive_pool.empty:
         col_a, col_b = st.columns(2)
@@ -614,19 +937,24 @@ with tab2:
     if portfolio is None or portfolio.empty:
         st.warning("Danh mục rỗng sau khi lọc. Hãy nới ngưỡng volatility hoặc giảm giá tối thiểu.")
     else:
-        show_port = portfolio.copy()
+        show_port = portfolio.copy().reset_index().rename(columns={"index": "ticker"})
         show_port = show_port[[
-            "mean_return", "volatility", "weight", "allocation_vnd", "shares"
+            "ticker",
+            "mean_return",
+            "volatility",
+            "weight",
+            "allocation_vnd",
+            "shares",
         ]].sort_values("weight", ascending=False)
 
         st.dataframe(show_port, use_container_width=True)
 
         fig = px.bar(
-            portfolio.reset_index(),
-            x="index",
+            show_port,
+            x="ticker",
             y="weight",
             title="Trọng số danh mục",
-            labels={"index": "Mã", "weight": "Trọng số"},
+            labels={"ticker": "Mã", "weight": "Trọng số"},
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -682,32 +1010,29 @@ with tab3:
         st.plotly_chart(fig, use_container_width=True)
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("CAGR danh mục", f"{bt['cagr']:.2%}")
-        c2.metric("Volatility", f"{bt['vol']:.2%}")
-        c3.metric("Sharpe-like", f"{bt['sharpe']:.2f}")
+        c1.metric("CAGR danh mục", f"{bt['cagr']:.2%}" if pd.notna(bt["cagr"]) else "N/A")
+        c2.metric("Volatility", f"{bt['vol']:.2%}" if pd.notna(bt["vol"]) else "N/A")
+        c3.metric("Sharpe-like", f"{bt['sharpe']:.2f}" if pd.notna(bt["sharpe"]) else "N/A")
 
         if "vn_cagr" in bt:
             c4, c5, c6 = st.columns(3)
-            c4.metric("CAGR VNINDEX", f"{bt['vn_cagr']:.2%}")
-            c5.metric("Vol VNINDEX", f"{bt['vn_vol']:.2%}")
-            c6.metric("Sharpe VNINDEX", f"{bt['vn_sharpe']:.2f}")
+            c4.metric("CAGR VNINDEX", f"{bt['vn_cagr']:.2%}" if pd.notna(bt["vn_cagr"]) else "N/A")
+            c5.metric("Vol VNINDEX", f"{bt['vn_vol']:.2%}" if pd.notna(bt["vn_vol"]) else "N/A")
+            c6.metric("Sharpe VNINDEX", f"{bt['vn_sharpe']:.2f}" if pd.notna(bt["vn_sharpe"]) else "N/A")
 
         st.write("### Dữ liệu backtest")
         st.dataframe(result.tail(20), use_container_width=True)
 
 # =========================================================
-# TAB 4 — LIVE UPDATE VIA VNSTOCK
+# TAB 4 — LIVE UPDATE
 # =========================================================
 with tab4:
     st.subheader("Cập nhật giá mỗi ngày bằng vnstock")
 
-    st.write(
-        f"Ưu tiên nguồn: **{VNSTOCK_PRIMARY_SOURCE}**. "
-        f"Nếu lỗi, tự fallback sang **{VNSTOCK_FALLBACK_SOURCE}**."
-    )
+    st.write(f"Ưu tiên nguồn: **{active_source}**, fallback: **{VNSTOCK_FALLBACK_SOURCE}**.")
 
     st.write("### Giá mới nhất của mã đang chọn")
-    latest_one = fetch_latest_close_vnstock(selected_ticker)
+    latest_one = fetch_latest_close_vnstock(selected_ticker, source=active_source)
     if latest_one is None:
         st.warning("Không lấy được giá mới nhất cho mã đang chọn.")
     else:
@@ -715,7 +1040,14 @@ with tab4:
         c1.metric("Mã", latest_one["ticker"])
         c2.metric("Giá đóng cửa mới nhất", f'{latest_one["close"]:.2f}')
         c3.metric("Nguồn", latest_one["source"])
-        st.write(latest_one)
+        st.json(
+            {
+                "ticker": latest_one["ticker"],
+                "date": str(latest_one["date"]),
+                "close": latest_one["close"],
+                "source": latest_one["source"],
+            }
+        )
 
     st.write("### Cập nhật hàng loạt trong phiên")
     st.info(
@@ -724,22 +1056,21 @@ with tab4:
     )
 
     st.write("### Bảng cập nhật gần nhất trong phiên")
-    if "price_wide" in st.session_state:
-        st.dataframe(st.session_state.price_wide.reset_index().tail(5), use_container_width=True)
+    st.dataframe(st.session_state.price_wide.reset_index().tail(5), use_container_width=True)
 
     st.caption(
-        "Nếu muốn lưu vĩnh viễn dữ liệu cập nhật, cần một job riêng để đồng bộ ngược vào Drive hoặc GitHub. "
+        "Muốn lưu vĩnh viễn dữ liệu cập nhật thì cần một job đồng bộ riêng. "
         "Streamlit Cloud chỉ giữ thay đổi trong phiên hiện tại."
     )
 
 # =========================================================
-# TAB 5 — LONG MODEL ARTIFACTS
+# TAB 5 — LONG MODEL
 # =========================================================
 with tab5:
     st.subheader("Mô hình LONG đã lưu")
 
     if long_model is None:
-        st.warning("Chưa nạp được long_model.pkl. Hãy cấu hình LONG_MODEL_ID hoặc đặt file trong repo.")
+        st.error("Chưa nạp được long_model.pkl.")
     else:
         st.success(f"Đã nạp mô hình: {type(long_model)}")
 
@@ -751,32 +1082,34 @@ with tab5:
         st.write("### Metadata")
         st.json(metadata)
 
-    st.write("### Walk-forward summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Walk-forward", "Có" if df_wf_summary is not None else "Thiếu")
+    c2.metric("OOS decile", "Có" if df_decile is not None else "Thiếu")
+    c3.metric("Backtest OOS", "Có" if df_backtest is not None else "Thiếu")
+    c4.metric("LONG picks", "Có" if df_latest_top is not None else "Thiếu")
+
     if df_wf_summary is not None:
+        st.write("### Walk-forward summary")
         st.dataframe(df_wf_summary, use_container_width=True)
-    else:
-        st.info("Chưa có walk_forward_summary.csv.")
 
-    st.write("### OOS decile performance")
     if df_decile is not None:
+        st.write("### OOS decile performance")
         st.dataframe(df_decile, use_container_width=True)
-    else:
-        st.info("Chưa có oos_decile_performance.csv.")
 
-    st.write("### Backtest OOS top-K vs VNINDEX")
     if df_backtest is not None:
+        st.write("### Backtest OOS top-K vs VNINDEX")
         st.dataframe(df_backtest.tail(20), use_container_width=True)
-    else:
-        st.info("Chưa có oos_topk_backtest_vs_vnindex.csv.")
 
-    st.write("### Top 30 tín hiệu LONG gần nhất")
+    if df_regime_backtest is not None:
+        st.write("### Backtest có lọc regime")
+        st.dataframe(df_regime_backtest.tail(20), use_container_width=True)
+
     if df_latest_top is not None:
+        st.write("### Top 30 tín hiệu LONG gần nhất")
         st.dataframe(df_latest_top, use_container_width=True)
-    else:
-        st.info("Chưa có latest_top30_predictions.csv.")
 
-    st.write("### Feature importance")
     if df_importance is not None:
+        st.write("### Feature importance")
         st.dataframe(df_importance.head(20), use_container_width=True)
         fig = px.bar(
             df_importance.sort_values("importance", ascending=True),
@@ -786,8 +1119,66 @@ with tab5:
             title="Mức độ quan trọng của feature",
         )
         st.plotly_chart(fig, use_container_width=True)
+
+    if df_corr is not None:
+        st.write("### Tương quan feature với forward return")
+        st.dataframe(df_corr.head(20), use_container_width=True)
+
+    st.divider()
+    st.write("### Chấm điểm LONG theo thời gian thực")
+    mode = st.radio("Phạm vi chấm điểm", ["Mã đang chọn", "Nhiều mã"], horizontal=True)
+
+    if mode == "Mã đang chọn":
+        live_tickers = [selected_ticker]
     else:
-        st.info("Chưa có long_model_feature_importance.csv.")
+        live_tickers = st.multiselect(
+            "Chọn mã để chấm",
+            ticker_list,
+            default=ticker_list[:10] if len(ticker_list) >= 10 else ticker_list,
+        )
+
+    if st.button("Chấm điểm LONG ngay"):
+        if long_model is None or feature_cols is None:
+            st.error("Thiếu model hoặc feature_cols.")
+        elif not live_tickers:
+            st.warning("Chưa chọn mã nào.")
+        else:
+            results = []
+            prog = st.progress(0)
+            for i, tk in enumerate(live_tickers, start=1):
+                scored = score_long_ticker(tk, history_days=int(history_days_input), source=active_source)
+                if scored is not None:
+                    row, feat = scored
+                    results.append(
+                        {
+                            "ticker": row["ticker"],
+                            "date": row["date"],
+                            "close": row["close"],
+                            "long_probability": row["long_probability"],
+                            "signal": row["signal"],
+                            "history_rows": row["history_rows"],
+                        }
+                    )
+                prog.progress(i / len(live_tickers))
+
+            if not results:
+                st.warning("Không chấm được mã nào. Có thể do dữ liệu vnstock chưa đủ dài hoặc lỗi nguồn.")
+            else:
+                score_df = pd.DataFrame(results).sort_values("long_probability", ascending=False)
+                st.session_state["live_long_scores"] = score_df
+
+                st.write("### Bảng xếp hạng LONG")
+                st.dataframe(score_df, use_container_width=True)
+
+                st.write("### Top 20")
+                st.dataframe(score_df.head(20), use_container_width=True)
+
+                if selected_ticker in score_df["ticker"].values:
+                    one = score_df[score_df["ticker"] == selected_ticker].iloc[0]
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Mã đang chọn", one["ticker"])
+                    c2.metric("Xác suất LONG", f"{one['long_probability']:.2%}")
+                    c3.metric("Tín hiệu", one["signal"])
 
 # =========================================================
 # TAB 6 — STOCK EXPLORER
@@ -795,19 +1186,17 @@ with tab5:
 with tab6:
     st.subheader("Cổ phiếu chi tiết")
 
-    start_date = st.date_input("Từ ngày", value=date_min.date(), key="start_detail")
-    end_date = st.date_input("Đến ngày", value=date_max.date(), key="end_detail")
+    start_date_detail = st.date_input("Từ ngày", value=date_min.date(), key="start_detail")
+    end_date_detail = st.date_input("Đến ngày", value=date_max.date(), key="end_detail")
 
     d = price_wide[[selected_ticker]].copy()
-    d = d.loc[pd.to_datetime(start_date): pd.to_datetime(end_date)].dropna().reset_index()
-    d = d.rename(columns={selected_ticker: "close"})
-    d = d.sort_values("time")
+    d = d.loc[pd.to_datetime(start_date_detail) : pd.to_datetime(end_date_detail)].dropna().reset_index()
+    d = d.rename(columns={selected_ticker: "close"}).sort_values("time")
 
     if d.empty:
         st.warning("Không có dữ liệu trong khoảng ngày này.")
     else:
-        d_overlay = make_price_overlay(d.rename(columns={"time": "date"}).assign(date=d["time"]))
-        # d_overlay có cột date, close, MA20, MA50, RSI14, BUY_overlay, SELL_overlay
+        d_overlay = make_price_overlay(d.rename(columns={"time": "date"}).copy())
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Giá đầu kỳ", f"{d['close'].iloc[0]:.2f}")
@@ -820,19 +1209,24 @@ with tab6:
         fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["MA20"], name="MA20", line=dict(width=2)))
         fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["MA50"], name="MA50", line=dict(width=2)))
 
-        buy = d_overlay[d_overlay["BUY_overlay"]]
-        sell = d_overlay[d_overlay["SELL_overlay"]]
+        if show_overlay:
+            buy = d_overlay[d_overlay["BUY_overlay"]]
+            sell = d_overlay[d_overlay["SELL_overlay"]]
 
-        fig.add_trace(go.Scatter(
-            x=buy["date"], y=buy["close"],
-            mode="markers", name="BUY",
-            marker=dict(symbol="triangle-up", size=11)
-        ))
-        fig.add_trace(go.Scatter(
-            x=sell["date"], y=sell["close"],
-            mode="markers", name="SELL",
-            marker=dict(symbol="triangle-down", size=11)
-        ))
+            fig.add_trace(go.Scatter(
+                x=buy["date"],
+                y=buy["close"],
+                mode="markers",
+                name="BUY",
+                marker=dict(symbol="triangle-up", size=11),
+            ))
+            fig.add_trace(go.Scatter(
+                x=sell["date"],
+                y=sell["close"],
+                mode="markers",
+                name="SELL",
+                marker=dict(symbol="triangle-down", size=11),
+            ))
 
         fig.update_layout(
             height=700,
