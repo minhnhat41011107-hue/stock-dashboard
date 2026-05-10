@@ -798,8 +798,7 @@ with st.spinner("Đang tải dữ liệu lõi..."):
     missing_required = check_required_files()
     if missing_required:
         st.error("Thiếu file bắt buộc:")
-        st.code("
-".join(missing_required))
+        st.code("\n".join(missing_required))
         st.stop()
 
     price_wide_base = load_price_wide()
