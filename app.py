@@ -1,10 +1,11 @@
 # app.py
 # VN Stock Dashboard + Roboadvisor + LONG Screener
 # Giao diện 100% tiếng Việt
-# Phiên bản ổn định cho Streamlit Cloud:
+# Phiên bản ổn định cho Streamlit Cloud
 # - Chỉ tải 4 file lõi khi khởi động
 # - Dữ liệu phụ tải theo nút bấm (không sync folder lúc startup)
 # - LONG realtime dùng form để tránh rerun liên tục
+# - Hỗ trợ đăng ký API key vnstock để giảm giới hạn request
 
 import os
 import json
@@ -20,7 +21,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.cluster import KMeans
-from vnstock import Quote
+from vnstock import Quote, Trading, Listing, register_user
 
 # =========================================================
 # PAGE CONFIG
@@ -52,13 +53,16 @@ FEATURE_COLS_ID = get_cfg("FEATURE_COLS_ID", "1RSvGie6w_Xl9OHo-X9EqgfqC9Z5Oc-4_"
 PRICE_ALIGNED_COPY_ID = get_cfg("PRICE_ALIGNED_COPY_ID", "1CCaW7V10VPRF6r33fvdJOn-yj6nnffxD")
 METADATA_ID = get_cfg("METADATA_ID", "1LmGfNmAyvQ94hGqZJi0hR1oGp--hzFAp")
 
-# Dữ liệu phụ: chỉ tải khi người dùng bấm nút, không tải lúc startup
+# Dữ liệu phụ: chỉ tải khi người dùng bấm nút
 OPTIONAL_FOLDER_URL = get_cfg(
     "KHOALUAN_FOLDER_URL",
     "https://drive.google.com/drive/folders/1VcKf2mWjmeiN16kpj25I7zrbPhxlXmqg?usp=sharing",
 )
 
-VNSTOCK_PRIMARY_SOURCE = get_cfg("VNSTOCK_SOURCE", "KBS")
+# API key vnstock
+VNSTOCK_API_KEY = get_cfg("VNSTOCK_API_KEY", "").strip()
+
+VNSTOCK_PRIMARY_SOURCE = get_cfg("VNSTOCK_SOURCE", "KBS").strip().upper() or "KBS"
 VNSTOCK_FALLBACK_SOURCE = "VCI" if VNSTOCK_PRIMARY_SOURCE == "KBS" else "KBS"
 
 CORE_CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_core_files"
@@ -88,6 +92,21 @@ OPTIONAL_FILES = [
 ]
 
 # =========================================================
+# VNSTOCK AUTH
+# =========================================================
+@st.cache_resource(show_spinner=False)
+def init_vnstock_auth() -> bool:
+    if not VNSTOCK_API_KEY:
+        return False
+    try:
+        register_user(VNSTOCK_API_KEY)
+        return True
+    except Exception:
+        return False
+
+VNSTOCK_AUTH_OK = init_vnstock_auth()
+
+# =========================================================
 # HELPERS: DOWNLOAD FILES BY ID
 # =========================================================
 def download_one(file_id: str, out_name: str, cache_dir: Path) -> Path | None:
@@ -107,9 +126,7 @@ def download_one(file_id: str, out_name: str, cache_dir: Path) -> Path | None:
 
 @st.cache_resource(show_spinner=False)
 def sync_optional_folder() -> Path | None:
-    """
-    Tải dữ liệu phụ theo nút bấm. Không gọi ở startup.
-    """
+    """Tải dữ liệu phụ theo nút bấm. Không gọi ở startup."""
     marker = EXTRA_CACHE_DIR / ".synced"
     if marker.exists():
         return EXTRA_CACHE_DIR
@@ -130,10 +147,7 @@ def sync_optional_folder() -> Path | None:
 
 
 def resolve_required_artifact(rel_path: str) -> Path | None:
-    """
-    Chỉ dùng cho 4 file lõi.
-    Ưu tiên file local trong repo. Nếu không có thì tải theo file ID.
-    """
+    """Chỉ dùng cho 4 file lõi."""
     local_candidates = [
         Path(rel_path),
         Path("data") / rel_path,
@@ -159,11 +173,7 @@ def resolve_required_artifact(rel_path: str) -> Path | None:
 
 
 def resolve_optional_artifact(rel_path: str, allow_remote: bool = False) -> Path | None:
-    """
-    Chỉ dùng cho file phụ.
-    Nếu allow_remote=False thì chỉ kiểm tra file local trong repo.
-    Nếu allow_remote=True thì mới tải từ Drive folder đã cache trong phiên.
-    """
+    """Chỉ dùng cho file phụ."""
     local_candidates = [
         Path(rel_path),
         Path("data") / rel_path,
@@ -175,25 +185,8 @@ def resolve_optional_artifact(rel_path: str, allow_remote: bool = False) -> Path
         if p.exists():
             return p
 
-    if not allow_remote:
+    if not allow_remote or not st.session_state.get("extras_loaded", False):
         return None
-
-    if not st.session_state.get("extras_loaded", False):
-        return None
-
-    root = sync_optional_folder()
-    if root is None:
-        return None
-
-    direct = root / rel_path
-    if direct.exists():
-        return direct
-
-    matches = list(root.rglob(Path(rel_path).name))
-    if matches:
-        return matches[0]
-
-    return None
 
     root = sync_optional_folder()
     if root is None:
@@ -211,8 +204,7 @@ def resolve_optional_artifact(rel_path: str, allow_remote: bool = False) -> Path
 
 
 def check_required_files():
-    missing = [p for p in REQUIRED_FILES if resolve_required_artifact(p) is None]
-    return missing
+    return [p for p in REQUIRED_FILES if resolve_required_artifact(p) is None]
 
 
 @st.cache_data(show_spinner=False)
@@ -259,9 +251,7 @@ def load_price_wide() -> pd.DataFrame:
     """
     p = resolve_required_artifact("data/price_aligned_copy.csv")
     if p is None:
-        raise FileNotFoundError(
-            "Không tìm thấy data/price_aligned_copy.csv trong repo hoặc qua file ID."
-        )
+        raise FileNotFoundError("Không tìm thấy data/price_aligned_copy.csv trong repo hoặc qua file ID.")
 
     df = pd.read_csv(p, low_memory=False)
     df.columns = [str(c).strip() for c in df.columns]
@@ -292,7 +282,7 @@ def build_returns(price_wide: pd.DataFrame) -> pd.DataFrame:
 # =========================================================
 # HELPERS: VNSTOCK LIVE UPDATE
 # =========================================================
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=30)
 def fetch_ohlc_history(ticker: str, start_date: str, end_date: str, source: str = "KBS") -> pd.DataFrame | None:
     for src in [source, VNSTOCK_FALLBACK_SOURCE]:
         try:
@@ -320,9 +310,7 @@ def fetch_ohlc_history(ticker: str, start_date: str, end_date: str, source: str 
             hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
             hist = hist.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
             hist["ticker"] = ticker
-
             return hist
-
         except Exception:
             continue
 
@@ -330,8 +318,9 @@ def fetch_ohlc_history(ticker: str, start_date: str, end_date: str, source: str 
 
 
 def fetch_latest_close_vnstock(ticker: str, source: str = "KBS") -> dict | None:
+    # lấy cửa sổ ngắn để giảm tải và cho dữ liệu mới nhất
     end_dt = date.today()
-    start_dt = end_dt - timedelta(days=15)
+    start_dt = end_dt - timedelta(days=10)
     hist = fetch_ohlc_history(
         ticker=ticker,
         start_date=start_dt.strftime("%Y-%m-%d"),
@@ -376,6 +365,7 @@ def merge_live_updates_into_price_wide(price_wide: pd.DataFrame, updates: pd.Dat
         out = pd.concat([out, pd.DataFrame([new_row], index=[latest_date])], axis=0)
 
     out = out.sort_index()
+    out.index.name = "time"
     return out
 
 
@@ -670,12 +660,9 @@ def cluster_levels(levels, max_k=4):
 
 
 def build_live_features(ohlc: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tái tạo gần nhất pipeline feature từ notebook LONG cho một mã.
-    """
+    """Tái tạo gần nhất pipeline feature từ notebook LONG cho một mã."""
     temp = ohlc.copy().sort_values("date").reset_index(drop=True)
 
-    # đảm bảo cột
     for c in ["open", "high", "low", "close", "volume"]:
         if c not in temp.columns:
             temp[c] = temp["close"]
@@ -726,20 +713,12 @@ def build_live_features(ohlc: pd.DataFrame) -> pd.DataFrame:
         below = [s for s in support_levels if s <= price]
         above = [r for r in resistance_levels if r >= price]
 
-        if below:
-            dist_sup.append((price - max(below)) / price)
-        else:
-            dist_sup.append(np.nan)
-
-        if above:
-            dist_res.append((min(above) - price) / price)
-        else:
-            dist_res.append(np.nan)
+        dist_sup.append((price - max(below)) / price if below else np.nan)
+        dist_res.append((min(above) - price) / price if above else np.nan)
 
     temp["dist_support"] = pd.Series(dist_sup, index=temp.index).bfill().ffill().fillna(0)
     temp["dist_resistance"] = pd.Series(dist_res, index=temp.index).ffill().bfill().fillna(0)
 
-    # Mother structure
     temp["MA200"] = temp["close"].rolling(200, min_periods=150).mean()
     temp["High250"] = temp["close"].rolling(250, min_periods=200).max()
     temp["Low250"] = temp["close"].rolling(250, min_periods=200).min()
@@ -784,7 +763,6 @@ def score_long_ticker(ticker: str, history_days: int = 420, source: str = "KBS")
         return None
 
     latest = feat.iloc[-1:].copy()
-
     for c in feature_cols:
         if c not in latest.columns:
             latest[c] = np.nan
@@ -820,7 +798,8 @@ with st.spinner("Đang tải dữ liệu lõi..."):
     missing_required = check_required_files()
     if missing_required:
         st.error("Thiếu file bắt buộc:")
-        st.code("\n".join(missing_required))
+        st.code("
+".join(missing_required))
         st.stop()
 
     price_wide_base = load_price_wide()
@@ -843,8 +822,6 @@ long_model = load_pickle_required("models/long_model.pkl")
 feature_cols = load_pickle_required("models/feature_cols.pkl")
 metadata = load_json_required("metadata/metadata.json")
 
-# Optional artifacts: chỉ hiện khi extras_loaded = True hoặc file local tồn tại
-# Không tải gì lúc startup nếu chưa bấm nút tải dữ liệu phụ.
 df_ml = load_csv_optional("data/ml_df.csv", allow_remote=st.session_state.extras_loaded)
 df_wf = load_csv_optional("data/walk_forward_df.csv", allow_remote=st.session_state.extras_loaded)
 df_oos = load_csv_optional("predictions/wf_oos_predictions.csv", allow_remote=st.session_state.extras_loaded)
@@ -860,6 +837,16 @@ df_regime_backtest = load_csv_optional("backtest/regime_filtered_oos_topk_backte
 # SIDEBAR
 # =========================================================
 st.sidebar.header("Điều khiển")
+
+if VNSTOCK_API_KEY:
+    st.sidebar.success("vnstock API key đã được cấu hình")
+else:
+    st.sidebar.warning("Chưa cấu hình VNSTOCK_API_KEY")
+
+if VNSTOCK_AUTH_OK:
+    st.sidebar.success("vnstock đã đăng ký tài khoản thành công")
+else:
+    st.sidebar.info("Đang dùng chế độ truy cập thông thường hoặc đăng ký chưa thành công")
 
 if st.sidebar.button("Tải dữ liệu phụ từ Drive"):
     with st.spinner("Đang tải dữ liệu phụ..."):
@@ -924,6 +911,10 @@ if refresh_btn:
 
     progress = st.sidebar.progress(0)
     updates = []
+    # clear cached history before refreshing
+    fetch_ohlc_history.clear()
+    fetch_latest_close_vnstock.clear()
+
     for i, tk in enumerate(tickers_to_update, start=1):
         rec = fetch_latest_close_vnstock(tk, source=active_source)
         if rec is not None:
@@ -942,7 +933,6 @@ if refresh_btn:
     else:
         st.sidebar.error("Không lấy được giá mới từ vnstock.")
 
-# refresh local refs after update
 price_wide = st.session_state.price_wide
 returns_wide = st.session_state.returns_wide
 
@@ -984,12 +974,7 @@ with tab1:
     st.write("### Trạng thái file đã nạp")
     rows = []
     for fn in REQUIRED_FILES:
-        rows.append(
-            {
-                "file": fn,
-                "status": "Đã nạp" if resolve_required_artifact(fn) is not None else "Thiếu",
-            }
-        )
+        rows.append({"file": fn, "status": "Đã nạp" if resolve_required_artifact(fn) is not None else "Thiếu"})
     for fn in OPTIONAL_FILES:
         rows.append(
             {
@@ -1028,18 +1013,9 @@ with tab2:
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Vol cutoff", f"{stats.get('vol_cutoff', np.nan):.4f}")
-    c6.metric(
-        "Lợi nhuận kỳ vọng",
-        f"{stats.get('expected_return', np.nan):.2%}" if pd.notna(stats.get("expected_return", np.nan)) else "N/A",
-    )
-    c7.metric(
-        "Rủi ro kỳ vọng",
-        f"{stats.get('expected_risk', np.nan):.2%}" if pd.notna(stats.get("expected_risk", np.nan)) else "N/A",
-    )
-    c8.metric(
-        "Return/Risk",
-        f"{stats.get('return_risk', np.nan):.2f}" if pd.notna(stats.get("return_risk", np.nan)) else "N/A",
-    )
+    c6.metric("Lợi nhuận kỳ vọng", f"{stats.get('expected_return', np.nan):.2%}" if pd.notna(stats.get("expected_return", np.nan)) else "N/A")
+    c7.metric("Rủi ro kỳ vọng", f"{stats.get('expected_risk', np.nan):.2%}" if pd.notna(stats.get("expected_risk", np.nan)) else "N/A")
+    c8.metric("Return/Risk", f"{stats.get('return_risk', np.nan):.2f}" if pd.notna(stats.get("return_risk", np.nan)) else "N/A")
 
     st.write(f"**Số mã đủ điều kiện:** {len(filtered):,}")
     if not filtered.empty:
@@ -1060,24 +1036,10 @@ with tab2:
         st.warning("Danh mục rỗng sau khi lọc. Hãy nới ngưỡng volatility hoặc giảm giá tối thiểu.")
     else:
         show_port = portfolio.rename_axis("ticker").reset_index()
-        show_port = show_port[[
-            "ticker",
-            "mean_return",
-            "volatility",
-            "weight",
-            "allocation_vnd",
-            "shares",
-        ]].sort_values("weight", ascending=False)
-
+        show_port = show_port[["ticker", "mean_return", "volatility", "weight", "allocation_vnd", "shares"]].sort_values("weight", ascending=False)
         st.dataframe(show_port, width="stretch")
 
-        fig = px.bar(
-            show_port,
-            x="ticker",
-            y="weight",
-            title="Trọng số danh mục",
-            labels={"ticker": "Mã", "weight": "Trọng số"},
-        )
+        fig = px.bar(show_port, x="ticker", y="weight", title="Trọng số danh mục", labels={"ticker": "Mã", "weight": "Trọng số"})
         st.plotly_chart(fig, width="stretch")
 
 # =========================================================
@@ -1104,31 +1066,11 @@ with tab3:
         result = bt["result"]
 
         fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=result.index,
-                y=result["Portfolio"],
-                name="Danh mục",
-                line=dict(width=2),
-            )
-        )
-
+        fig.add_trace(go.Scatter(x=result.index, y=result["Portfolio"], name="Danh mục", line=dict(width=2)))
         if "VNINDEX" in result.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=result.index,
-                    y=result["VNINDEX"],
-                    name="VNINDEX",
-                    line=dict(width=2),
-                )
-            )
+            fig.add_trace(go.Scatter(x=result.index, y=result["VNINDEX"], name="VNINDEX", line=dict(width=2)))
 
-        fig.update_layout(
-            height=600,
-            xaxis_title="Ngày",
-            yaxis_title="NAV",
-            legend_title="Đường cong",
-        )
+        fig.update_layout(height=600, xaxis_title="Ngày", yaxis_title="NAV", legend_title="Đường cong")
         st.plotly_chart(fig, width="stretch")
 
         c1, c2, c3 = st.columns(3)
@@ -1152,6 +1094,8 @@ with tab4:
     st.subheader("Cập nhật giá mỗi ngày bằng vnstock")
 
     st.write(f"Ưu tiên nguồn: **{active_source}**, fallback: **{VNSTOCK_FALLBACK_SOURCE}**.")
+    if VNSTOCK_API_KEY:
+        st.caption("vnstock API key đã được nạp để giảm giới hạn request.")
 
     st.write("### Giá mới nhất của mã đang chọn")
     latest_one = fetch_latest_close_vnstock(selected_ticker, source=active_source)
@@ -1162,27 +1106,15 @@ with tab4:
         c1.metric("Mã", latest_one["ticker"])
         c2.metric("Giá đóng cửa mới nhất", f"{latest_one['close']:.2f}")
         c3.metric("Nguồn", latest_one["source"])
-        st.json(
-            {
-                "ticker": latest_one["ticker"],
-                "date": str(latest_one["date"]),
-                "close": latest_one["close"],
-                "source": latest_one["source"],
-            }
-        )
+        st.json({"ticker": latest_one["ticker"], "date": str(latest_one["date"]), "close": latest_one["close"], "source": latest_one["source"]})
 
     st.write("### Cập nhật hàng loạt trong phiên")
-    st.info(
-        "Nút cập nhật ở sidebar sẽ kéo giá hôm nay cho mã đang chọn và VNINDEX. "
-        "Toàn bộ giá mới chỉ lưu trong phiên hiện tại."
-    )
+    st.info("Nút cập nhật ở sidebar sẽ kéo giá hôm nay cho mã đang chọn và VNINDEX. Toàn bộ giá mới chỉ lưu trong phiên hiện tại.")
 
     st.write("### Bảng cập nhật gần nhất trong phiên")
     st.dataframe(st.session_state.price_wide.reset_index().tail(5), width="stretch")
 
-    st.caption(
-        "Muốn lưu vĩnh viễn dữ liệu cập nhật thì cần một job đồng bộ riêng. Streamlit Cloud chỉ giữ thay đổi trong phiên hiện tại."
-    )
+    st.caption("Muốn lưu vĩnh viễn dữ liệu cập nhật thì cần một job đồng bộ riêng. Streamlit Cloud chỉ giữ thay đổi trong phiên hiện tại.")
 
 # =========================================================
 # TAB 5 — LONG MODEL
@@ -1233,13 +1165,7 @@ with tab5:
         if df_importance is not None:
             st.write("### Feature importance")
             st.dataframe(df_importance.head(20), width="stretch")
-            fig = px.bar(
-                df_importance.sort_values("importance", ascending=True),
-                x="importance",
-                y="feature",
-                orientation="h",
-                title="Mức độ quan trọng của feature",
-            )
+            fig = px.bar(df_importance.sort_values("importance", ascending=True), x="importance", y="feature", orientation="h", title="Mức độ quan trọng của feature")
             st.plotly_chart(fig, width="stretch")
 
         if df_corr is not None:
@@ -1255,37 +1181,18 @@ with tab5:
         st.session_state.live_tickers_selected = [selected_ticker]
 
     with st.form("long_scoring_form", clear_on_submit=False):
-        mode = st.radio(
-            "Chế độ",
-            ["Mã đang chọn", "Nhiều mã"],
-            horizontal=True,
-            key="long_mode_radio",
-        )
+        mode = st.radio("Chế độ", ["Mã đang chọn", "Nhiều mã"], horizontal=True, key="long_mode_radio")
 
         if mode == "Mã đang chọn":
             live_tickers = [selected_ticker]
             st.info(f"Đang chấm theo mã đang chọn: {selected_ticker}")
         else:
-            max_symbols = st.slider(
-                "Số lượng mã tối đa",
-                min_value=5,
-                max_value=20,
-                value=10,
-                step=5,
-                key="long_max_symbols_slider",
-            )
-
+            max_symbols = st.slider("Số lượng mã tối đa", min_value=5, max_value=20, value=10, step=5, key="long_max_symbols_slider")
             default_symbols = [t for t in st.session_state.live_tickers_selected if t in ticker_list][:max_symbols]
             if not default_symbols:
                 default_symbols = ticker_list[: min(max_symbols, len(ticker_list))]
 
-            selected_symbols = st.multiselect(
-                "Chọn mã để chấm",
-                ticker_list,
-                default=default_symbols,
-                key="long_multiselect",
-            )
-
+            selected_symbols = st.multiselect("Chọn mã để chấm", ticker_list, default=default_symbols, key="long_multiselect")
             live_tickers = [t for t in selected_symbols if t in ticker_list][:max_symbols]
 
         submitted = st.form_submit_button("Chấm điểm LONG ngay")
@@ -1306,13 +1213,9 @@ with tab5:
             for i, tk in enumerate(live_tickers, start=1):
                 try:
                     status.info(f"Đang xử lý: {tk} ({i}/{total})")
-                    scored = score_long_ticker(
-                        tk,
-                        history_days=int(history_days_input),
-                        source=active_source,
-                    )
+                    scored = score_long_ticker(tk, history_days=int(history_days_input), source=active_source)
                     if scored is not None:
-                        row, feat = scored
+                        row, _feat = scored
                         results.append(
                             {
                                 "ticker": row["ticker"],
@@ -1325,7 +1228,6 @@ with tab5:
                         )
                 except Exception as e:
                     st.warning(f"Lỗi mã {tk}: {str(e)}")
-
                 prog.progress(i / total)
 
             prog.empty()
@@ -1334,16 +1236,10 @@ with tab5:
             if not results:
                 st.warning("Không chấm được mã nào. Có thể dữ liệu vnstock thiếu hoặc mạng quá chậm.")
             else:
-                score_df = (
-                    pd.DataFrame(results)
-                    .sort_values("long_probability", ascending=False)
-                    .reset_index(drop=True)
-                )
-
+                score_df = pd.DataFrame(results).sort_values("long_probability", ascending=False).reset_index(drop=True)
                 st.session_state["live_long_scores"] = score_df
 
                 st.success(f"Đã chấm {len(score_df)} mã.")
-
                 st.write("### Bảng xếp hạng LONG realtime")
                 st.dataframe(score_df, width="stretch", height=500)
 
@@ -1351,14 +1247,7 @@ with tab5:
                 top10 = score_df.head(10)
                 st.dataframe(top10, width="stretch")
 
-                fig = px.bar(
-                    top10,
-                    x="ticker",
-                    y="long_probability",
-                    color="signal",
-                    title="Top xác suất LONG",
-                    labels={"ticker": "Mã", "long_probability": "Xác suất LONG"},
-                )
+                fig = px.bar(top10, x="ticker", y="long_probability", color="signal", title="Top xác suất LONG", labels={"ticker": "Mã", "long_probability": "Xác suất LONG"})
                 st.plotly_chart(fig, width="stretch")
 
                 if selected_ticker in score_df["ticker"].values:
