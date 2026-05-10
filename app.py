@@ -1134,48 +1134,62 @@ with tab5:
 
     st.subheader("Chấm điểm LONG realtime")
 
-    mode = st.radio(
-        "Chế độ",
-        ["Mã đang chọn", "Nhiều mã"],
-        horizontal=True,
-    )
+    if "live_tickers_selected" not in st.session_state:
+        st.session_state.live_tickers_selected = [selected_ticker]
 
-    if mode == "Mã đang chọn":
-        live_tickers = [selected_ticker]
+    with st.form("long_scoring_form", clear_on_submit=False):
 
-    else:
-
-        max_symbols = st.slider(
-            "Số lượng mã tối đa",
-            min_value=5,
-            max_value=50,
-            value=10,
-            step=5,
+        mode = st.radio(
+            "Chế độ",
+            ["Mã đang chọn", "Nhiều mã"],
+            horizontal=True,
+            key="long_mode_radio",
         )
 
-        default_symbols = (
-            ticker_list[:max_symbols]
-            if len(ticker_list) >= max_symbols
-            else ticker_list
+        if mode == "Mã đang chọn":
+            live_tickers = [selected_ticker]
+            st.info(f"Đang chấm theo mã đang chọn: {selected_ticker}")
+
+        else:
+            max_symbols = st.slider(
+                "Số lượng mã tối đa",
+                min_value=5,
+                max_value=50,
+                value=10,
+                step=5,
+                key="long_max_symbols_slider",
+            )
+
+            default_symbols = [
+                t for t in st.session_state.live_tickers_selected if t in ticker_list
+            ][:max_symbols]
+
+            if not default_symbols:
+                default_symbols = ticker_list[:min(max_symbols, len(ticker_list))]
+
+            selected_symbols = st.multiselect(
+                "Chọn mã để chấm",
+                ticker_list,
+                default=default_symbols,
+                key="long_multiselect",
+            )
+
+            live_tickers = [
+                t for t in selected_symbols if t in ticker_list
+            ][:max_symbols]
+
+        history_days_input = st.number_input(
+            "Số ngày lịch sử dùng để tính feature",
+            min_value=120,
+            max_value=2000,
+            value=400,
+            step=20,
+            key="long_history_days_input",
         )
 
-        live_tickers = st.multiselect(
-            "Chọn mã để chấm",
-            ticker_list,
-            default=default_symbols,
-        )
+        submitted = st.form_submit_button("Chấm điểm LONG ngay")
 
-        live_tickers = live_tickers[:max_symbols]
-
-    history_days_input = st.number_input(
-        "Số ngày lịch sử dùng để tính feature",
-        min_value=120,
-        max_value=2000,
-        value=400,
-        step=20,
-    )
-
-    if st.button("Chấm điểm LONG ngay"):
+    if submitted:
 
         if long_model is None or feature_cols is None:
             st.error("Thiếu model hoặc feature_cols.")
@@ -1184,18 +1198,15 @@ with tab5:
             st.warning("Chưa chọn mã nào.")
 
         else:
+            st.session_state.live_tickers_selected = live_tickers[:]
 
             results = []
-
             prog = st.progress(0)
             status = st.empty()
-
             total = len(live_tickers)
 
             for i, tk in enumerate(live_tickers, start=1):
-
                 try:
-
                     status.info(f"Đang xử lý: {tk} ({i}/{total})")
 
                     scored = score_long_ticker(
@@ -1205,9 +1216,7 @@ with tab5:
                     )
 
                     if scored is not None:
-
                         row, feat = scored
-
                         results.append(
                             {
                                 "ticker": row["ticker"],
@@ -1220,7 +1229,6 @@ with tab5:
                         )
 
                 except Exception as e:
-
                     st.warning(f"Lỗi mã {tk}: {str(e)}")
 
                 prog.progress(i / total)
@@ -1229,13 +1237,9 @@ with tab5:
             status.empty()
 
             if not results:
-
-                st.warning(
-                    "Không chấm được mã nào. Có thể dữ liệu vnstock thiếu hoặc mạng quá chậm."
-                )
+                st.warning("Không chấm được mã nào. Có thể dữ liệu vnstock thiếu hoặc mạng quá chậm.")
 
             else:
-
                 score_df = (
                     pd.DataFrame(results)
                     .sort_values("long_probability", ascending=False)
@@ -1247,21 +1251,11 @@ with tab5:
                 st.success(f"Đã chấm {len(score_df)} mã.")
 
                 st.write("### Bảng xếp hạng LONG realtime")
-
-                st.dataframe(
-                    score_df,
-                    use_container_width=True,
-                    height=500,
-                )
+                st.dataframe(score_df, use_container_width=True, height=500)
 
                 st.write("### Top 10 cơ hội LONG")
-
                 top10 = score_df.head(10)
-
-                st.dataframe(
-                    top10,
-                    use_container_width=True,
-                )
+                st.dataframe(top10, use_container_width=True)
 
                 fig = px.bar(
                     top10,
@@ -1269,38 +1263,14 @@ with tab5:
                     y="long_probability",
                     color="signal",
                     title="Top xác suất LONG",
-                    labels={
-                        "ticker": "Mã",
-                        "long_probability": "Xác suất LONG",
-                    },
+                    labels={"ticker": "Mã", "long_probability": "Xác suất LONG"},
                 )
-
                 st.plotly_chart(fig, use_container_width=True)
 
                 if selected_ticker in score_df["ticker"].values:
-
-                    one = score_df[
-                        score_df["ticker"] == selected_ticker
-                    ].iloc[0]
-
+                    one = score_df[score_df["ticker"] == selected_ticker].iloc[0]
                     c1, c2, c3, c4 = st.columns(4)
-
-                    c1.metric(
-                        "Mã",
-                        one["ticker"],
-                    )
-
-                    c2.metric(
-                        "Giá gần nhất",
-                        f"{one['close']:.2f}",
-                    )
-
-                    c3.metric(
-                        "Xác suất LONG",
-                        f"{one['long_probability']:.2%}",
-                    )
-
-                    c4.metric(
-                        "Tín hiệu",
-                        one["signal"],
-                    )
+                    c1.metric("Mã", one["ticker"])
+                    c2.metric("Giá gần nhất", f"{one['close']:.2f}")
+                    c3.metric("Xác suất LONG", f"{one['long_probability']:.2%}")
+                    c4.metric("Tín hiệu", one["signal"])
