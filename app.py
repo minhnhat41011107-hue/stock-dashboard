@@ -23,6 +23,16 @@ import streamlit as st
 from sklearn.cluster import KMeans
 from vnstock import Quote, Trading, Listing, register_user
 
+@st.cache_resource(show_spinner=False)
+def init_vnstock_auth() -> bool:
+    if not VNSTOCK_API_KEY:
+        return False
+    try:
+        register_user(api_key=VNSTOCK_API_KEY)
+        return True
+    except Exception:
+        return False
+
 # =========================================================
 # PAGE CONFIG
 # =========================================================
