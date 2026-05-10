@@ -1380,6 +1380,16 @@ with tab6:
 
     d = price_wide[[selected_ticker]].copy()
     d = d.loc[pd.to_datetime(start_date_detail) : pd.to_datetime(end_date_detail)].dropna().reset_index()
+
+    # chuẩn hoá tên cột thời gian sau reset_index()
+    if "time" not in d.columns:
+        if "date" in d.columns:
+            d = d.rename(columns={"date": "time"})
+        elif "index" in d.columns:
+            d = d.rename(columns={"index": "time"})
+        else:
+            d = d.rename(columns={d.columns[0]: "time"})
+
     d = d.rename(columns={selected_ticker: "close"}).sort_values("time")
 
     if d.empty:
