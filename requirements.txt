@@ -2,9 +2,10 @@ streamlit
 pandas
 numpy
 plotly
-gdown
-pyarrow
 scikit-learn
 xgboost
 joblib
+gdown
 vnstock
+openpyxl
+matplotlib
