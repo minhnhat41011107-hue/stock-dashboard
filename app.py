@@ -158,10 +158,11 @@ def resolve_required_artifact(rel_path: str) -> Path | None:
     return None
 
 
-def resolve_optional_artifact(rel_path: str) -> Path | None:
+def resolve_optional_artifact(rel_path: str, allow_remote: bool = False) -> Path | None:
     """
     Chỉ dùng cho file phụ.
-    Không tải gì nếu người dùng chưa bấm nút tải dữ liệu phụ.
+    Nếu allow_remote=False thì chỉ kiểm tra file local trong repo.
+    Nếu allow_remote=True thì mới tải từ Drive folder đã cache trong phiên.
     """
     local_candidates = [
         Path(rel_path),
@@ -174,8 +175,25 @@ def resolve_optional_artifact(rel_path: str) -> Path | None:
         if p.exists():
             return p
 
+    if not allow_remote:
+        return None
+
     if not st.session_state.get("extras_loaded", False):
         return None
+
+    root = sync_optional_folder()
+    if root is None:
+        return None
+
+    direct = root / rel_path
+    if direct.exists():
+        return direct
+
+    matches = list(root.rglob(Path(rel_path).name))
+    if matches:
+        return matches[0]
+
+    return None
 
     root = sync_optional_folder()
     if root is None:
@@ -223,8 +241,8 @@ def load_pickle_required(rel_path: str):
 
 
 @st.cache_data(show_spinner=False)
-def load_csv_optional(rel_path: str) -> pd.DataFrame | None:
-    p = resolve_optional_artifact(rel_path)
+def load_csv_optional(rel_path: str, allow_remote: bool) -> pd.DataFrame | None:
+    p = resolve_optional_artifact(rel_path, allow_remote=allow_remote)
     if p is None:
         return None
     return pd.read_csv(p, low_memory=False)
@@ -827,16 +845,16 @@ metadata = load_json_required("metadata/metadata.json")
 
 # Optional artifacts: chỉ hiện khi extras_loaded = True hoặc file local tồn tại
 # Không tải gì lúc startup nếu chưa bấm nút tải dữ liệu phụ.
-df_ml = load_csv_optional("data/ml_df.csv")
-df_wf = load_csv_optional("data/walk_forward_df.csv")
-df_oos = load_csv_optional("predictions/wf_oos_predictions.csv")
-df_latest_top = load_csv_optional("predictions/latest_top30_predictions.csv")
-df_decile = load_csv_optional("results/oos_decile_performance.csv")
-df_wf_summary = load_csv_optional("results/walk_forward_summary.csv")
-df_importance = load_csv_optional("results/long_model_feature_importance.csv")
-df_corr = load_csv_optional("results/feature_future_return_correlation.csv")
-df_backtest = load_csv_optional("backtest/oos_topk_backtest_vs_vnindex.csv")
-df_regime_backtest = load_csv_optional("backtest/regime_filtered_oos_topk_backtest_vs_vnindex.csv")
+df_ml = load_csv_optional("data/ml_df.csv", allow_remote=st.session_state.extras_loaded)
+df_wf = load_csv_optional("data/walk_forward_df.csv", allow_remote=st.session_state.extras_loaded)
+df_oos = load_csv_optional("predictions/wf_oos_predictions.csv", allow_remote=st.session_state.extras_loaded)
+df_latest_top = load_csv_optional("predictions/latest_top30_predictions.csv", allow_remote=st.session_state.extras_loaded)
+df_decile = load_csv_optional("results/oos_decile_performance.csv", allow_remote=st.session_state.extras_loaded)
+df_wf_summary = load_csv_optional("results/walk_forward_summary.csv", allow_remote=st.session_state.extras_loaded)
+df_importance = load_csv_optional("results/long_model_feature_importance.csv", allow_remote=st.session_state.extras_loaded)
+df_corr = load_csv_optional("results/feature_future_return_correlation.csv", allow_remote=st.session_state.extras_loaded)
+df_backtest = load_csv_optional("backtest/oos_topk_backtest_vs_vnindex.csv", allow_remote=st.session_state.extras_loaded)
+df_regime_backtest = load_csv_optional("backtest/regime_filtered_oos_topk_backtest_vs_vnindex.csv", allow_remote=st.session_state.extras_loaded)
 
 # =========================================================
 # SIDEBAR
@@ -976,7 +994,7 @@ with tab1:
         rows.append(
             {
                 "file": fn,
-                "status": "Đã nạp" if resolve_optional_artifact(fn) is not None else "Chưa nạp / tùy chọn",
+                "status": "Đã nạp" if resolve_optional_artifact(fn, allow_remote=st.session_state.extras_loaded) is not None else "Chưa nạp / tùy chọn",
             }
         )
     st.dataframe(pd.DataFrame(rows), width="stretch")
