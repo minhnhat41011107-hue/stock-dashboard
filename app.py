@@ -60,7 +60,7 @@ OPTIONAL_FOLDER_URL = get_cfg(
 )
 
 # API key vnstock
-VNSTOCK_API_KEY = get_cfg("VNSTOCK_API_KEY", "").strip()
+VNSTOCK_API_KEY = get_cfg("vnstock_aaab902776edf70323db0f169b4ee80c", "").strip()
 
 VNSTOCK_PRIMARY_SOURCE = get_cfg("VNSTOCK_SOURCE", "KBS").strip().upper() or "KBS"
 VNSTOCK_FALLBACK_SOURCE = "VCI" if VNSTOCK_PRIMARY_SOURCE == "KBS" else "KBS"
