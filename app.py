@@ -37,21 +37,24 @@ st.caption(
 # =========================================================
 # CONFIG
 # =========================================================
+# =========================================================
+# CONFIG
+# =========================================================
 def get_cfg(key: str, default: str = "") -> str:
     try:
         return st.secrets.get(key, default)
     except Exception:
         return os.getenv(key, default)
 
-KHOALUAN_FOLDER_URL = get_cfg(
-    "KHOALUAN_FOLDER_URL",
-    "https://drive.google.com/drive/folders/1VcKf2mWjmeiN16kpj25I7zrbPhxlXmqg?usp=sharing",
-)
+LONG_MODEL_ID = get_cfg("LONG_MODEL_ID", "1nQbV59VCT5HLEGAcZCcTLk5ackhPyPS6")
+FEATURE_COLS_ID = get_cfg("FEATURE_COLS_ID", "1RSvGie6w_Xl9OHo-X9EqgfqC9Z5Oc-4_")
+PRICE_ALIGNED_COPY_ID = get_cfg("PRICE_ALIGNED_COPY_ID", "1CCaW7V10VPRF6r33fvdJOn-yj6nnffxD")
+METADATA_ID = get_cfg("METADATA_ID", "1LmGfNmAyvQ94hGqZJi0hR1oGp--hzFAp")
 
 VNSTOCK_PRIMARY_SOURCE = get_cfg("VNSTOCK_SOURCE", "KBS")
 VNSTOCK_FALLBACK_SOURCE = "VCI" if VNSTOCK_PRIMARY_SOURCE == "KBS" else "KBS"
 
-CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_drive_mirror"
+CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_files"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 REQUIRED_FILES = [
@@ -75,33 +78,27 @@ OPTIONAL_FILES = [
 ]
 
 # =========================================================
-# HELPERS: DRIVE SYNC
+# HELPERS: DOWNLOAD FILES BY ID
 # =========================================================
-@st.cache_resource(show_spinner=False)
-def sync_drive_folder() -> Path:
-    marker = CACHE_DIR / ".synced"
-    if marker.exists():
-        return CACHE_DIR
+def download_one(file_id: str, out_name: str) -> Path | None:
+    if not file_id:
+        return None
 
-    if not KHOALUAN_FOLDER_URL.strip():
-        return CACHE_DIR
+    out_path = CACHE_DIR / out_name
+    if out_path.exists():
+        return out_path
 
-    gdown.download_folder(
-        url=KHOALUAN_FOLDER_URL.strip(),
-        output=str(CACHE_DIR),
-        quiet=True,
-    )
-    marker.write_text("ok", encoding="utf-8")
-    return CACHE_DIR
+    url = f"https://drive.google.com/uc?id={file_id}"
+    gdown.download(url, str(out_path), quiet=True)
+    return out_path if out_path.exists() else None
 
 
 def resolve_artifact(rel_path: str) -> Path | None:
     """
-    Tìm file theo:
-    1) local repo
-    2) folder mirror từ Drive
+    Ưu tiên file local trong repo.
+    Nếu không có thì tải đúng file từ Drive bằng file ID.
     """
-    candidates = [
+    local_candidates = [
         Path(rel_path),
         Path("data") / rel_path,
         Path("models") / rel_path,
@@ -110,19 +107,20 @@ def resolve_artifact(rel_path: str) -> Path | None:
         Path("backtest") / rel_path,
         Path("metadata") / rel_path,
     ]
-    for p in candidates:
+    for p in local_candidates:
         if p.exists():
             return p
 
-    root = sync_drive_folder()
+    mapping = {
+        "models/long_model.pkl": (LONG_MODEL_ID, "long_model.pkl"),
+        "models/feature_cols.pkl": (FEATURE_COLS_ID, "feature_cols.pkl"),
+        "data/price_aligned_copy.csv": (PRICE_ALIGNED_COPY_ID, "price_aligned_copy.csv"),
+        "metadata/metadata.json": (METADATA_ID, "metadata.json"),
+    }
 
-    direct = root / rel_path
-    if direct.exists():
-        return direct
-
-    matches = list(root.rglob(Path(rel_path).name))
-    if matches:
-        return matches[0]
+    if rel_path in mapping:
+        file_id, out_name = mapping[rel_path]
+        return download_one(file_id, out_name)
 
     return None
 
@@ -154,7 +152,7 @@ def load_pickle_asset(rel_path: str):
     p = resolve_artifact(rel_path)
     if p is None:
         return None
-    return joblib.load(p)
+    return joblib.load(p) 
 
 
 # =========================================================
