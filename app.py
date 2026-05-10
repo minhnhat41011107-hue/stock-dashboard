@@ -961,7 +961,7 @@ with tab1:
     c8.metric("Model LONG", "Có" if long_model is not None else "Không")
 
     st.write("### Bảng giá mẫu")
-    st.dataframe(price_wide.reset_index().tail(10), use_container_width=True)
+    st.dataframe(price_wide.reset_index().tail(10), width="stretch")
 
     st.write("### Trạng thái file đã nạp")
     rows = []
@@ -979,7 +979,7 @@ with tab1:
                 "status": "Đã nạp" if resolve_optional_artifact(fn) is not None else "Chưa nạp / tùy chọn",
             }
         )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch")
 
     if metadata:
         st.write("### Metadata mô hình")
@@ -1026,16 +1026,16 @@ with tab2:
     st.write(f"**Số mã đủ điều kiện:** {len(filtered):,}")
     if not filtered.empty:
         st.write("### Universe sau khi lọc")
-        st.dataframe(filtered.sort_values("mean_return", ascending=False).head(20), use_container_width=True)
+        st.dataframe(filtered.sort_values("mean_return", ascending=False).head(20), width="stretch")
 
     if not growth_pool.empty and not defensive_pool.empty:
         col_a, col_b = st.columns(2)
         with col_a:
             st.write("#### Nhóm tăng trưởng")
-            st.dataframe(growth_pool.head(15), use_container_width=True)
+            st.dataframe(growth_pool.head(15), width="stretch")
         with col_b:
             st.write("#### Nhóm phòng thủ")
-            st.dataframe(defensive_pool.head(15), use_container_width=True)
+            st.dataframe(defensive_pool.head(15), width="stretch")
 
     st.write("### Danh mục đề xuất")
     if portfolio is None or portfolio.empty:
@@ -1051,7 +1051,7 @@ with tab2:
             "shares",
         ]].sort_values("weight", ascending=False)
 
-        st.dataframe(show_port, use_container_width=True)
+        st.dataframe(show_port, width="stretch")
 
         fig = px.bar(
             show_port,
@@ -1060,7 +1060,7 @@ with tab2:
             title="Trọng số danh mục",
             labels={"ticker": "Mã", "weight": "Trọng số"},
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 # =========================================================
 # TAB 3 — BACKTEST
@@ -1111,7 +1111,7 @@ with tab3:
             yaxis_title="NAV",
             legend_title="Đường cong",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("CAGR danh mục", f"{bt['cagr']:.2%}" if pd.notna(bt["cagr"]) else "N/A")
@@ -1125,7 +1125,7 @@ with tab3:
             c6.metric("Sharpe VNINDEX", f"{bt['vn_sharpe']:.2f}" if pd.notna(bt["vn_sharpe"]) else "N/A")
 
         st.write("### Dữ liệu backtest")
-        st.dataframe(result.tail(20), use_container_width=True)
+        st.dataframe(result.tail(20), width="stretch")
 
 # =========================================================
 # TAB 4 — LIVE UPDATE
@@ -1160,7 +1160,7 @@ with tab4:
     )
 
     st.write("### Bảng cập nhật gần nhất trong phiên")
-    st.dataframe(st.session_state.price_wide.reset_index().tail(5), use_container_width=True)
+    st.dataframe(st.session_state.price_wide.reset_index().tail(5), width="stretch")
 
     st.caption(
         "Muốn lưu vĩnh viễn dữ liệu cập nhật thì cần một job đồng bộ riêng. Streamlit Cloud chỉ giữ thay đổi trong phiên hiện tại."
@@ -1194,27 +1194,27 @@ with tab5:
     if st.session_state.get("extras_loaded", False):
         if df_wf_summary is not None:
             st.write("### Walk-forward summary")
-            st.dataframe(df_wf_summary, use_container_width=True)
+            st.dataframe(df_wf_summary, width="stretch")
 
         if df_decile is not None:
             st.write("### OOS decile performance")
-            st.dataframe(df_decile, use_container_width=True)
+            st.dataframe(df_decile, width="stretch")
 
         if df_backtest is not None:
             st.write("### Backtest OOS top-K vs VNINDEX")
-            st.dataframe(df_backtest.tail(20), use_container_width=True)
+            st.dataframe(df_backtest.tail(20), width="stretch")
 
         if df_regime_backtest is not None:
             st.write("### Backtest có lọc regime")
-            st.dataframe(df_regime_backtest.tail(20), use_container_width=True)
+            st.dataframe(df_regime_backtest.tail(20), width="stretch")
 
         if df_latest_top is not None:
             st.write("### Top 30 tín hiệu LONG gần nhất")
-            st.dataframe(df_latest_top, use_container_width=True)
+            st.dataframe(df_latest_top, width="stretch")
 
         if df_importance is not None:
             st.write("### Feature importance")
-            st.dataframe(df_importance.head(20), use_container_width=True)
+            st.dataframe(df_importance.head(20), width="stretch")
             fig = px.bar(
                 df_importance.sort_values("importance", ascending=True),
                 x="importance",
@@ -1222,11 +1222,11 @@ with tab5:
                 orientation="h",
                 title="Mức độ quan trọng của feature",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         if df_corr is not None:
             st.write("### Tương quan feature với forward return")
-            st.dataframe(df_corr.head(20), use_container_width=True)
+            st.dataframe(df_corr.head(20), width="stretch")
     else:
         st.info("Bấm nút 'Tải dữ liệu phụ từ Drive' ở sidebar nếu muốn xem các bảng kết quả/backtest đã lưu.")
 
@@ -1327,11 +1327,11 @@ with tab5:
                 st.success(f"Đã chấm {len(score_df)} mã.")
 
                 st.write("### Bảng xếp hạng LONG realtime")
-                st.dataframe(score_df, use_container_width=True, height=500)
+                st.dataframe(score_df, width="stretch", height=500)
 
                 st.write("### Top 10 cơ hội LONG")
                 top10 = score_df.head(10)
-                st.dataframe(top10, use_container_width=True)
+                st.dataframe(top10, width="stretch")
 
                 fig = px.bar(
                     top10,
@@ -1341,7 +1341,7 @@ with tab5:
                     title="Top xác suất LONG",
                     labels={"ticker": "Mã", "long_probability": "Xác suất LONG"},
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 if selected_ticker in score_df["ticker"].values:
                     one = score_df[score_df["ticker"] == selected_ticker].iloc[0]
@@ -1405,10 +1405,10 @@ with tab6:
             yaxis_title="Giá",
             xaxis_rangeslider_visible=True,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.write("### Bảng dữ liệu")
-        st.dataframe(d_overlay.sort_values("date", ascending=False), use_container_width=True)
+        st.dataframe(d_overlay.sort_values("date", ascending=False), width="stretch")
 
         st.write("### Thống kê nhanh")
         daily_ret = d["close"].pct_change().fillna(0)
@@ -1423,4 +1423,4 @@ with tab6:
                 ],
             }
         )
-        st.dataframe(stats, use_container_width=True)
+        st.dataframe(stats, width="stretch")
