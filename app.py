@@ -1,7 +1,10 @@
 # app.py
 # VN Stock Dashboard + Roboadvisor + LONG Screener
-# Nguồn dữ liệu: folder Google Drive "Khoaluan"
 # Giao diện 100% tiếng Việt
+# Phiên bản ổn định cho Streamlit Cloud:
+# - Chỉ tải 4 file lõi khi khởi động
+# - Dữ liệu phụ tải theo nút bấm (không sync folder lúc startup)
+# - LONG realtime dùng form để tránh rerun liên tục
 
 import os
 import json
@@ -37,25 +40,32 @@ st.caption(
 # =========================================================
 # CONFIG
 # =========================================================
-# =========================================================
-# CONFIG
-# =========================================================
 def get_cfg(key: str, default: str = "") -> str:
     try:
         return st.secrets.get(key, default)
     except Exception:
         return os.getenv(key, default)
 
+# 4 file lõi (bắt buộc)
 LONG_MODEL_ID = get_cfg("LONG_MODEL_ID", "1nQbV59VCT5HLEGAcZCcTLk5ackhPyPS6")
 FEATURE_COLS_ID = get_cfg("FEATURE_COLS_ID", "1RSvGie6w_Xl9OHo-X9EqgfqC9Z5Oc-4_")
 PRICE_ALIGNED_COPY_ID = get_cfg("PRICE_ALIGNED_COPY_ID", "1CCaW7V10VPRF6r33fvdJOn-yj6nnffxD")
 METADATA_ID = get_cfg("METADATA_ID", "1LmGfNmAyvQ94hGqZJi0hR1oGp--hzFAp")
 
+# Dữ liệu phụ: chỉ tải khi người dùng bấm nút, không tải lúc startup
+OPTIONAL_FOLDER_URL = get_cfg(
+    "KHOALUAN_FOLDER_URL",
+    "https://drive.google.com/drive/folders/1VcKf2mWjmeiN16kpj25I7zrbPhxlXmqg?usp=sharing",
+)
+
 VNSTOCK_PRIMARY_SOURCE = get_cfg("VNSTOCK_SOURCE", "KBS")
 VNSTOCK_FALLBACK_SOURCE = "VCI" if VNSTOCK_PRIMARY_SOURCE == "KBS" else "KBS"
 
-CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_files"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CORE_CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_core_files"
+CORE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+EXTRA_CACHE_DIR = Path(tempfile.gettempdir()) / "khoaluan_extra_files"
+EXTRA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 REQUIRED_FILES = [
     "models/long_model.pkl",
@@ -80,31 +90,54 @@ OPTIONAL_FILES = [
 # =========================================================
 # HELPERS: DOWNLOAD FILES BY ID
 # =========================================================
-def download_one(file_id: str, out_name: str) -> Path | None:
+def download_one(file_id: str, out_name: str, cache_dir: Path) -> Path | None:
     if not file_id:
         return None
 
-    out_path = CACHE_DIR / out_name
+    out_path = cache_dir / out_name
     if out_path.exists():
         return out_path
 
     url = f"https://drive.google.com/uc?id={file_id}"
-    gdown.download(url, str(out_path), quiet=True)
+    ok = gdown.download(url, str(out_path), quiet=True)
+    if not ok:
+        return None
     return out_path if out_path.exists() else None
 
 
-def resolve_artifact(rel_path: str) -> Path | None:
+@st.cache_resource(show_spinner=False)
+def sync_optional_folder() -> Path | None:
     """
-    Ưu tiên file local trong repo.
-    Nếu không có thì tải đúng file từ Drive bằng file ID.
+    Tải dữ liệu phụ theo nút bấm. Không gọi ở startup.
+    """
+    marker = EXTRA_CACHE_DIR / ".synced"
+    if marker.exists():
+        return EXTRA_CACHE_DIR
+
+    if not OPTIONAL_FOLDER_URL.strip():
+        return None
+
+    try:
+        gdown.download_folder(
+            url=OPTIONAL_FOLDER_URL.strip(),
+            output=str(EXTRA_CACHE_DIR),
+            quiet=True,
+        )
+        marker.write_text("ok", encoding="utf-8")
+        return EXTRA_CACHE_DIR
+    except Exception:
+        return None
+
+
+def resolve_required_artifact(rel_path: str) -> Path | None:
+    """
+    Chỉ dùng cho 4 file lõi.
+    Ưu tiên file local trong repo. Nếu không có thì tải theo file ID.
     """
     local_candidates = [
         Path(rel_path),
         Path("data") / rel_path,
         Path("models") / rel_path,
-        Path("results") / rel_path,
-        Path("predictions") / rel_path,
-        Path("backtest") / rel_path,
         Path("metadata") / rel_path,
     ]
     for p in local_candidates:
@@ -120,27 +153,61 @@ def resolve_artifact(rel_path: str) -> Path | None:
 
     if rel_path in mapping:
         file_id, out_name = mapping[rel_path]
-        return download_one(file_id, out_name)
+        return download_one(file_id, out_name, CORE_CACHE_DIR)
+
+    return None
+
+
+def resolve_optional_artifact(rel_path: str) -> Path | None:
+    """
+    Chỉ dùng cho file phụ.
+    Không tải gì nếu người dùng chưa bấm nút tải dữ liệu phụ.
+    """
+    local_candidates = [
+        Path(rel_path),
+        Path("data") / rel_path,
+        Path("results") / rel_path,
+        Path("predictions") / rel_path,
+        Path("backtest") / rel_path,
+    ]
+    for p in local_candidates:
+        if p.exists():
+            return p
+
+    if not st.session_state.get("extras_loaded", False):
+        return None
+
+    root = sync_optional_folder()
+    if root is None:
+        return None
+
+    direct = root / rel_path
+    if direct.exists():
+        return direct
+
+    matches = list(root.rglob(Path(rel_path).name))
+    if matches:
+        return matches[0]
 
     return None
 
 
 def check_required_files():
-    missing = [p for p in REQUIRED_FILES if resolve_artifact(p) is None]
+    missing = [p for p in REQUIRED_FILES if resolve_required_artifact(p) is None]
     return missing
 
 
 @st.cache_data(show_spinner=False)
-def load_csv_asset(rel_path: str) -> pd.DataFrame | None:
-    p = resolve_artifact(rel_path)
+def load_csv_required(rel_path: str) -> pd.DataFrame | None:
+    p = resolve_required_artifact(rel_path)
     if p is None:
         return None
     return pd.read_csv(p, low_memory=False)
 
 
 @st.cache_data(show_spinner=False)
-def load_json_asset(rel_path: str) -> dict | None:
-    p = resolve_artifact(rel_path)
+def load_json_required(rel_path: str) -> dict | None:
+    p = resolve_required_artifact(rel_path)
     if p is None:
         return None
     with open(p, "r", encoding="utf-8") as f:
@@ -148,11 +215,19 @@ def load_json_asset(rel_path: str) -> dict | None:
 
 
 @st.cache_resource(show_spinner=False)
-def load_pickle_asset(rel_path: str):
-    p = resolve_artifact(rel_path)
+def load_pickle_required(rel_path: str):
+    p = resolve_required_artifact(rel_path)
     if p is None:
         return None
-    return joblib.load(p) 
+    return joblib.load(p)
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_optional(rel_path: str) -> pd.DataFrame | None:
+    p = resolve_optional_artifact(rel_path)
+    if p is None:
+        return None
+    return pd.read_csv(p, low_memory=False)
 
 
 # =========================================================
@@ -164,10 +239,10 @@ def load_price_wide() -> pd.DataFrame:
     price_aligned_copy.csv là wide:
     time, ticker1, ticker2, ..., VNINDEX
     """
-    p = resolve_artifact("data/price_aligned_copy.csv")
+    p = resolve_required_artifact("data/price_aligned_copy.csv")
     if p is None:
         raise FileNotFoundError(
-            "Không tìm thấy data/price_aligned_copy.csv trong repo hoặc folder Khoaluan."
+            "Không tìm thấy data/price_aligned_copy.csv trong repo hoặc qua file ID."
         )
 
     df = pd.read_csv(p, low_memory=False)
@@ -721,21 +796,23 @@ def score_long_ticker(ticker: str, history_days: int = 420, source: str = "KBS")
 
 
 # =========================================================
-# LOAD DATA / ARTIFACTS
+# LOAD CORE DATA
 # =========================================================
-with st.spinner("Đang đồng bộ dữ liệu từ Google Drive / repo..."):
+with st.spinner("Đang tải dữ liệu lõi..."):
     missing_required = check_required_files()
     if missing_required:
-        st.error("Thiếu file bắt buộc trong folder Khoaluan:")
+        st.error("Thiếu file bắt buộc:")
         st.code("\n".join(missing_required))
         st.stop()
 
     price_wide_base = load_price_wide()
 
-# session state for live updates
 if "price_wide" not in st.session_state:
     st.session_state.price_wide = price_wide_base.copy()
     st.session_state.returns_wide = build_returns(st.session_state.price_wide)
+
+st.session_state.setdefault("extras_loaded", False)
+st.session_state.setdefault("live_tickers_selected", [])
 
 price_wide = st.session_state.price_wide
 returns_wide = st.session_state.returns_wide
@@ -744,25 +821,42 @@ ticker_list = [c for c in price_wide.columns if c != "VNINDEX"]
 date_min = price_wide.index.min()
 date_max = price_wide.index.max()
 
-long_model = load_pickle_asset("models/long_model.pkl")
-feature_cols = load_pickle_asset("models/feature_cols.pkl")
-metadata = load_json_asset("metadata/metadata.json")
+long_model = load_pickle_required("models/long_model.pkl")
+feature_cols = load_pickle_required("models/feature_cols.pkl")
+metadata = load_json_required("metadata/metadata.json")
 
-df_ml = load_csv_asset("data/ml_df.csv")
-df_wf = load_csv_asset("data/walk_forward_df.csv")
-df_oos = load_csv_asset("predictions/wf_oos_predictions.csv")
-df_latest_top = load_csv_asset("predictions/latest_top30_predictions.csv")
-df_decile = load_csv_asset("results/oos_decile_performance.csv")
-df_wf_summary = load_csv_asset("results/walk_forward_summary.csv")
-df_importance = load_csv_asset("results/long_model_feature_importance.csv")
-df_corr = load_csv_asset("results/feature_future_return_correlation.csv")
-df_backtest = load_csv_asset("backtest/oos_topk_backtest_vs_vnindex.csv")
-df_regime_backtest = load_csv_asset("backtest/regime_filtered_oos_topk_backtest_vs_vnindex.csv")
+# Optional artifacts: chỉ hiện khi extras_loaded = True hoặc file local tồn tại
+# Không tải gì lúc startup nếu chưa bấm nút tải dữ liệu phụ.
+df_ml = load_csv_optional("data/ml_df.csv")
+df_wf = load_csv_optional("data/walk_forward_df.csv")
+df_oos = load_csv_optional("predictions/wf_oos_predictions.csv")
+df_latest_top = load_csv_optional("predictions/latest_top30_predictions.csv")
+df_decile = load_csv_optional("results/oos_decile_performance.csv")
+df_wf_summary = load_csv_optional("results/walk_forward_summary.csv")
+df_importance = load_csv_optional("results/long_model_feature_importance.csv")
+df_corr = load_csv_optional("results/feature_future_return_correlation.csv")
+df_backtest = load_csv_optional("backtest/oos_topk_backtest_vs_vnindex.csv")
+df_regime_backtest = load_csv_optional("backtest/regime_filtered_oos_topk_backtest_vs_vnindex.csv")
 
 # =========================================================
 # SIDEBAR
 # =========================================================
 st.sidebar.header("Điều khiển")
+
+if st.sidebar.button("Tải dữ liệu phụ từ Drive"):
+    with st.spinner("Đang tải dữ liệu phụ..."):
+        root = sync_optional_folder()
+    if root is None:
+        st.sidebar.error("Không tải được dữ liệu phụ.")
+    else:
+        st.session_state.extras_loaded = True
+        st.sidebar.success("Đã tải dữ liệu phụ. Hãy reload trang nếu cần.")
+        st.rerun()
+
+if st.session_state.get("extras_loaded", False):
+    st.sidebar.success("Dữ liệu phụ đã được nạp trong phiên hiện tại")
+else:
+    st.sidebar.info("Dữ liệu phụ chưa nạp")
 
 selected_ticker = st.sidebar.selectbox(
     "Chọn mã cổ phiếu",
@@ -799,40 +893,36 @@ history_days_input = st.sidebar.number_input(
 refresh_btn = st.sidebar.button("Cập nhật giá hôm nay", type="primary")
 
 st.sidebar.caption(
-    "Cập nhật qua vnstock chỉ lưu trong phiên hiện tại. "
-    "Muốn lưu vĩnh viễn thì cần job đồng bộ riêng."
+    "Cập nhật qua vnstock chỉ lưu trong phiên hiện tại. Muốn lưu vĩnh viễn thì cần job đồng bộ riêng."
 )
 
 # =========================================================
 # LIVE UPDATE ACTION
 # =========================================================
 if refresh_btn:
-    tickers_to_update = [selected_ticker] if update_mode == "Mã đang chọn" else ticker_list[:]
+    tickers_to_update = [selected_ticker]
     if update_benchmark:
         tickers_to_update = tickers_to_update + ["VNINDEX"]
 
-    if len(tickers_to_update) == 0:
-        st.sidebar.warning("Không có mã để cập nhật.")
-    else:
-        progress = st.sidebar.progress(0)
-        updates = []
-        for i, tk in enumerate(tickers_to_update, start=1):
-            rec = fetch_latest_close_vnstock(tk, source=active_source)
-            if rec is not None:
-                updates.append(rec)
-            progress.progress(i / len(tickers_to_update))
+    progress = st.sidebar.progress(0)
+    updates = []
+    for i, tk in enumerate(tickers_to_update, start=1):
+        rec = fetch_latest_close_vnstock(tk, source=active_source)
+        if rec is not None:
+            updates.append(rec)
+        progress.progress(i / len(tickers_to_update))
 
-        if updates:
-            updates_df = pd.DataFrame(updates)
-            st.session_state.price_wide = merge_live_updates_into_price_wide(
-                st.session_state.price_wide, updates_df
-            )
-            st.session_state.returns_wide = build_returns(st.session_state.price_wide)
-            price_wide = st.session_state.price_wide
-            returns_wide = st.session_state.returns_wide
-            st.sidebar.success(f"Đã cập nhật {len(updates_df)} mã trong phiên hiện tại.")
-        else:
-            st.sidebar.error("Không lấy được giá mới từ vnstock.")
+    if updates:
+        updates_df = pd.DataFrame(updates)
+        st.session_state.price_wide = merge_live_updates_into_price_wide(
+            st.session_state.price_wide, updates_df
+        )
+        st.session_state.returns_wide = build_returns(st.session_state.price_wide)
+        price_wide = st.session_state.price_wide
+        returns_wide = st.session_state.returns_wide
+        st.sidebar.success(f"Đã cập nhật {len(updates_df)} mã trong phiên hiện tại.")
+    else:
+        st.sidebar.error("Không lấy được giá mới từ vnstock.")
 
 # refresh local refs after update
 price_wide = st.session_state.price_wide
@@ -875,11 +965,18 @@ with tab1:
 
     st.write("### Trạng thái file đã nạp")
     rows = []
-    for fn in REQUIRED_FILES + OPTIONAL_FILES:
+    for fn in REQUIRED_FILES:
         rows.append(
             {
                 "file": fn,
-                "status": "Đã nạp" if resolve_artifact(fn) is not None else "Thiếu / tùy chọn",
+                "status": "Đã nạp" if resolve_required_artifact(fn) is not None else "Thiếu",
+            }
+        )
+    for fn in OPTIONAL_FILES:
+        rows.append(
+            {
+                "file": fn,
+                "status": "Đã nạp" if resolve_optional_artifact(fn) is not None else "Chưa nạp / tùy chọn",
             }
         )
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
@@ -913,9 +1010,18 @@ with tab2:
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Vol cutoff", f"{stats.get('vol_cutoff', np.nan):.4f}")
-    c6.metric("Lợi nhuận kỳ vọng", f"{stats.get('expected_return', np.nan):.2%}" if pd.notna(stats.get("expected_return", np.nan)) else "N/A")
-    c7.metric("Rủi ro kỳ vọng", f"{stats.get('expected_risk', np.nan):.2%}" if pd.notna(stats.get("expected_risk", np.nan)) else "N/A")
-    c8.metric("Return/Risk", f"{stats.get('return_risk', np.nan):.2f}" if pd.notna(stats.get("return_risk", np.nan)) else "N/A")
+    c6.metric(
+        "Lợi nhuận kỳ vọng",
+        f"{stats.get('expected_return', np.nan):.2%}" if pd.notna(stats.get("expected_return", np.nan)) else "N/A",
+    )
+    c7.metric(
+        "Rủi ro kỳ vọng",
+        f"{stats.get('expected_risk', np.nan):.2%}" if pd.notna(stats.get("expected_risk", np.nan)) else "N/A",
+    )
+    c8.metric(
+        "Return/Risk",
+        f"{stats.get('return_risk', np.nan):.2f}" if pd.notna(stats.get("return_risk", np.nan)) else "N/A",
+    )
 
     st.write(f"**Số mã đủ điều kiện:** {len(filtered):,}")
     if not filtered.empty:
@@ -935,7 +1041,7 @@ with tab2:
     if portfolio is None or portfolio.empty:
         st.warning("Danh mục rỗng sau khi lọc. Hãy nới ngưỡng volatility hoặc giảm giá tối thiểu.")
     else:
-        show_port = portfolio.copy().reset_index().rename(columns={"index": "ticker"})
+        show_port = portfolio.rename_axis("ticker").reset_index()
         show_port = show_port[[
             "ticker",
             "mean_return",
@@ -1036,7 +1142,7 @@ with tab4:
     else:
         c1, c2, c3 = st.columns(3)
         c1.metric("Mã", latest_one["ticker"])
-        c2.metric("Giá đóng cửa mới nhất", f'{latest_one["close"]:.2f}')
+        c2.metric("Giá đóng cửa mới nhất", f"{latest_one['close']:.2f}")
         c3.metric("Nguồn", latest_one["source"])
         st.json(
             {
@@ -1049,16 +1155,15 @@ with tab4:
 
     st.write("### Cập nhật hàng loạt trong phiên")
     st.info(
-        "Nút cập nhật ở sidebar sẽ kéo giá hôm nay cho mã đang chọn hoặc toàn bộ danh mục "
-        "và cập nhật ngay trong phiên hiện tại."
+        "Nút cập nhật ở sidebar sẽ kéo giá hôm nay cho mã đang chọn và VNINDEX. "
+        "Toàn bộ giá mới chỉ lưu trong phiên hiện tại."
     )
 
     st.write("### Bảng cập nhật gần nhất trong phiên")
     st.dataframe(st.session_state.price_wide.reset_index().tail(5), use_container_width=True)
 
     st.caption(
-        "Muốn lưu vĩnh viễn dữ liệu cập nhật thì cần một job đồng bộ riêng. "
-        "Streamlit Cloud chỉ giữ thay đổi trong phiên hiện tại."
+        "Muốn lưu vĩnh viễn dữ liệu cập nhật thì cần một job đồng bộ riêng. Streamlit Cloud chỉ giữ thay đổi trong phiên hiện tại."
     )
 
 # =========================================================
@@ -1086,57 +1191,52 @@ with tab5:
     c3.metric("Backtest OOS", "Có" if df_backtest is not None else "Thiếu")
     c4.metric("LONG picks", "Có" if df_latest_top is not None else "Thiếu")
 
-    if df_wf_summary is not None:
-        st.write("### Walk-forward summary")
-        st.dataframe(df_wf_summary, use_container_width=True)
+    if st.session_state.get("extras_loaded", False):
+        if df_wf_summary is not None:
+            st.write("### Walk-forward summary")
+            st.dataframe(df_wf_summary, use_container_width=True)
 
-    if df_decile is not None:
-        st.write("### OOS decile performance")
-        st.dataframe(df_decile, use_container_width=True)
+        if df_decile is not None:
+            st.write("### OOS decile performance")
+            st.dataframe(df_decile, use_container_width=True)
 
-    if df_backtest is not None:
-        st.write("### Backtest OOS top-K vs VNINDEX")
-        st.dataframe(df_backtest.tail(20), use_container_width=True)
+        if df_backtest is not None:
+            st.write("### Backtest OOS top-K vs VNINDEX")
+            st.dataframe(df_backtest.tail(20), use_container_width=True)
 
-    if df_regime_backtest is not None:
-        st.write("### Backtest có lọc regime")
-        st.dataframe(df_regime_backtest.tail(20), use_container_width=True)
+        if df_regime_backtest is not None:
+            st.write("### Backtest có lọc regime")
+            st.dataframe(df_regime_backtest.tail(20), use_container_width=True)
 
-    if df_latest_top is not None:
-        st.write("### Top 30 tín hiệu LONG gần nhất")
-        st.dataframe(df_latest_top, use_container_width=True)
+        if df_latest_top is not None:
+            st.write("### Top 30 tín hiệu LONG gần nhất")
+            st.dataframe(df_latest_top, use_container_width=True)
 
-    if df_importance is not None:
-        st.write("### Feature importance")
-        st.dataframe(df_importance.head(20), use_container_width=True)
-        fig = px.bar(
-            df_importance.sort_values("importance", ascending=True),
-            x="importance",
-            y="feature",
-            orientation="h",
-            title="Mức độ quan trọng của feature",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if df_importance is not None:
+            st.write("### Feature importance")
+            st.dataframe(df_importance.head(20), use_container_width=True)
+            fig = px.bar(
+                df_importance.sort_values("importance", ascending=True),
+                x="importance",
+                y="feature",
+                orientation="h",
+                title="Mức độ quan trọng của feature",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    if df_corr is not None:
-        st.write("### Tương quan feature với forward return")
-        st.dataframe(df_corr.head(20), use_container_width=True)
+        if df_corr is not None:
+            st.write("### Tương quan feature với forward return")
+            st.dataframe(df_corr.head(20), use_container_width=True)
+    else:
+        st.info("Bấm nút 'Tải dữ liệu phụ từ Drive' ở sidebar nếu muốn xem các bảng kết quả/backtest đã lưu.")
 
     st.divider()
-    st.write("### Chấm điểm LONG theo thời gian thực")
-    mode = st.radio("Phạm vi chấm điểm", ["Mã đang chọn", "Nhiều mã"], horizontal=True)
-
-    # =========================================================
-    # REALTIME LONG SCORING
-    # =========================================================
-
-    st.subheader("Chấm điểm LONG realtime")
+    st.write("### Chấm điểm LONG realtime")
 
     if "live_tickers_selected" not in st.session_state:
         st.session_state.live_tickers_selected = [selected_ticker]
 
     with st.form("long_scoring_form", clear_on_submit=False):
-
         mode = st.radio(
             "Chế độ",
             ["Mã đang chọn", "Nhiều mã"],
@@ -1147,23 +1247,19 @@ with tab5:
         if mode == "Mã đang chọn":
             live_tickers = [selected_ticker]
             st.info(f"Đang chấm theo mã đang chọn: {selected_ticker}")
-
         else:
             max_symbols = st.slider(
                 "Số lượng mã tối đa",
                 min_value=5,
-                max_value=50,
+                max_value=20,
                 value=10,
                 step=5,
                 key="long_max_symbols_slider",
             )
 
-            default_symbols = [
-                t for t in st.session_state.live_tickers_selected if t in ticker_list
-            ][:max_symbols]
-
+            default_symbols = [t for t in st.session_state.live_tickers_selected if t in ticker_list][:max_symbols]
             if not default_symbols:
-                default_symbols = ticker_list[:min(max_symbols, len(ticker_list))]
+                default_symbols = ticker_list[: min(max_symbols, len(ticker_list))]
 
             selected_symbols = st.multiselect(
                 "Chọn mã để chấm",
@@ -1172,29 +1268,15 @@ with tab5:
                 key="long_multiselect",
             )
 
-            live_tickers = [
-                t for t in selected_symbols if t in ticker_list
-            ][:max_symbols]
-
-        history_days_input = st.number_input(
-            "Số ngày lịch sử dùng để tính feature",
-            min_value=120,
-            max_value=2000,
-            value=400,
-            step=20,
-            key="long_history_days_input",
-        )
+            live_tickers = [t for t in selected_symbols if t in ticker_list][:max_symbols]
 
         submitted = st.form_submit_button("Chấm điểm LONG ngay")
 
     if submitted:
-
         if long_model is None or feature_cols is None:
             st.error("Thiếu model hoặc feature_cols.")
-
         elif not live_tickers:
             st.warning("Chưa chọn mã nào.")
-
         else:
             st.session_state.live_tickers_selected = live_tickers[:]
 
@@ -1206,13 +1288,11 @@ with tab5:
             for i, tk in enumerate(live_tickers, start=1):
                 try:
                     status.info(f"Đang xử lý: {tk} ({i}/{total})")
-
                     scored = score_long_ticker(
                         tk,
                         history_days=int(history_days_input),
                         source=active_source,
                     )
-
                     if scored is not None:
                         row, feat = scored
                         results.append(
@@ -1225,7 +1305,6 @@ with tab5:
                                 "history_rows": int(row["history_rows"]),
                             }
                         )
-
                 except Exception as e:
                     st.warning(f"Lỗi mã {tk}: {str(e)}")
 
@@ -1236,7 +1315,6 @@ with tab5:
 
             if not results:
                 st.warning("Không chấm được mã nào. Có thể dữ liệu vnstock thiếu hoặc mạng quá chậm.")
-
             else:
                 score_df = (
                     pd.DataFrame(results)
@@ -1272,3 +1350,77 @@ with tab5:
                     c2.metric("Giá gần nhất", f"{one['close']:.2f}")
                     c3.metric("Xác suất LONG", f"{one['long_probability']:.2%}")
                     c4.metric("Tín hiệu", one["signal"])
+
+# =========================================================
+# TAB 6 — STOCK EXPLORER
+# =========================================================
+with tab6:
+    st.subheader("Cổ phiếu chi tiết")
+
+    start_date_detail = st.date_input("Từ ngày", value=date_min.date(), key="start_detail")
+    end_date_detail = st.date_input("Đến ngày", value=date_max.date(), key="end_detail")
+
+    d = price_wide[[selected_ticker]].copy()
+    d = d.loc[pd.to_datetime(start_date_detail) : pd.to_datetime(end_date_detail)].dropna().reset_index()
+    d = d.rename(columns={selected_ticker: "close"}).sort_values("time")
+
+    if d.empty:
+        st.warning("Không có dữ liệu trong khoảng ngày này.")
+    else:
+        d_overlay = make_price_overlay(d.rename(columns={"time": "date"}).copy())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Giá đầu kỳ", f"{d['close'].iloc[0]:.2f}")
+        c2.metric("Giá cuối kỳ", f"{d['close'].iloc[-1]:.2f}")
+        c3.metric("Cao nhất", f"{d['close'].max():.2f}")
+        c4.metric("Thấp nhất", f"{d['close'].min():.2f}")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["close"], name="Giá", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["MA20"], name="MA20", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["MA50"], name="MA50", line=dict(width=2)))
+
+        if show_overlay:
+            buy = d_overlay[d_overlay["BUY_overlay"]]
+            sell = d_overlay[d_overlay["SELL_overlay"]]
+
+            fig.add_trace(go.Scatter(
+                x=buy["date"],
+                y=buy["close"],
+                mode="markers",
+                name="BUY",
+                marker=dict(symbol="triangle-up", size=11),
+            ))
+            fig.add_trace(go.Scatter(
+                x=sell["date"],
+                y=sell["close"],
+                mode="markers",
+                name="SELL",
+                marker=dict(symbol="triangle-down", size=11),
+            ))
+
+        fig.update_layout(
+            height=700,
+            xaxis_title="Ngày",
+            yaxis_title="Giá",
+            xaxis_rangeslider_visible=True,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.write("### Bảng dữ liệu")
+        st.dataframe(d_overlay.sort_values("date", ascending=False), use_container_width=True)
+
+        st.write("### Thống kê nhanh")
+        daily_ret = d["close"].pct_change().fillna(0)
+        stats = pd.DataFrame(
+            {
+                "Chỉ tiêu": ["Lợi nhuận TB/ngày", "Biến động/ngày", "Tổng lợi nhuận", "Số phiên"],
+                "Giá trị": [
+                    f"{daily_ret.mean():.4%}",
+                    f"{daily_ret.std():.4%}",
+                    f"{(d['close'].iloc[-1] / d['close'].iloc[0] - 1):.2%}",
+                    f"{len(d):,}",
+                ],
+            }
+        )
+        st.dataframe(stats, use_container_width=True)
