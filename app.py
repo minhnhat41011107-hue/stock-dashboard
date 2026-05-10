@@ -784,7 +784,7 @@ show_overlay = st.sidebar.checkbox("Hiển thị BUY/SELL overlay", value=True)
 
 update_mode = st.sidebar.radio(
     "Cập nhật giá bằng vnstock",
-    ["Mã đang chọn", "Toàn bộ danh mục"],
+    ["Mã đang chọn"],
 )
 
 update_benchmark = st.sidebar.checkbox("Cập nhật thêm VNINDEX", value=True)
@@ -1128,128 +1128,179 @@ with tab5:
     st.write("### Chấm điểm LONG theo thời gian thực")
     mode = st.radio("Phạm vi chấm điểm", ["Mã đang chọn", "Nhiều mã"], horizontal=True)
 
+    # =========================================================
+    # REALTIME LONG SCORING
+    # =========================================================
+
+    st.subheader("Chấm điểm LONG realtime")
+
+    mode = st.radio(
+        "Chế độ",
+        ["Mã đang chọn", "Nhiều mã"],
+        horizontal=True,
+    )
+
     if mode == "Mã đang chọn":
         live_tickers = [selected_ticker]
+
     else:
+
+        max_symbols = st.slider(
+            "Số lượng mã tối đa",
+            min_value=5,
+            max_value=50,
+            value=10,
+            step=5,
+        )
+
+        default_symbols = (
+            ticker_list[:max_symbols]
+            if len(ticker_list) >= max_symbols
+            else ticker_list
+        )
+
         live_tickers = st.multiselect(
             "Chọn mã để chấm",
             ticker_list,
-            default=ticker_list[:10] if len(ticker_list) >= 10 else ticker_list,
+            default=default_symbols,
         )
+
+        live_tickers = live_tickers[:max_symbols]
+
+    history_days_input = st.number_input(
+        "Số ngày lịch sử dùng để tính feature",
+        min_value=120,
+        max_value=2000,
+        value=400,
+        step=20,
+    )
 
     if st.button("Chấm điểm LONG ngay"):
+
         if long_model is None or feature_cols is None:
             st.error("Thiếu model hoặc feature_cols.")
+
         elif not live_tickers:
             st.warning("Chưa chọn mã nào.")
+
         else:
+
             results = []
+
             prog = st.progress(0)
+            status = st.empty()
+
+            total = len(live_tickers)
+
             for i, tk in enumerate(live_tickers, start=1):
-                scored = score_long_ticker(tk, history_days=int(history_days_input), source=active_source)
-                if scored is not None:
-                    row, feat = scored
-                    results.append(
-                        {
-                            "ticker": row["ticker"],
-                            "date": row["date"],
-                            "close": row["close"],
-                            "long_probability": row["long_probability"],
-                            "signal": row["signal"],
-                            "history_rows": row["history_rows"],
-                        }
+
+                try:
+
+                    status.info(f"Đang xử lý: {tk} ({i}/{total})")
+
+                    scored = score_long_ticker(
+                        tk,
+                        history_days=int(history_days_input),
+                        source=active_source,
                     )
-                prog.progress(i / len(live_tickers))
+
+                    if scored is not None:
+
+                        row, feat = scored
+
+                        results.append(
+                            {
+                                "ticker": row["ticker"],
+                                "date": row["date"],
+                                "close": round(float(row["close"]), 2),
+                                "long_probability": round(float(row["long_probability"]), 4),
+                                "signal": row["signal"],
+                                "history_rows": int(row["history_rows"]),
+                            }
+                        )
+
+                except Exception as e:
+
+                    st.warning(f"Lỗi mã {tk}: {str(e)}")
+
+                prog.progress(i / total)
+
+            prog.empty()
+            status.empty()
 
             if not results:
-                st.warning("Không chấm được mã nào. Có thể do dữ liệu vnstock chưa đủ dài hoặc lỗi nguồn.")
+
+                st.warning(
+                    "Không chấm được mã nào. Có thể dữ liệu vnstock thiếu hoặc mạng quá chậm."
+                )
+
             else:
-                score_df = pd.DataFrame(results).sort_values("long_probability", ascending=False)
+
+                score_df = (
+                    pd.DataFrame(results)
+                    .sort_values("long_probability", ascending=False)
+                    .reset_index(drop=True)
+                )
+
                 st.session_state["live_long_scores"] = score_df
 
-                st.write("### Bảng xếp hạng LONG")
-                st.dataframe(score_df, use_container_width=True)
+                st.success(f"Đã chấm {len(score_df)} mã.")
 
-                st.write("### Top 20")
-                st.dataframe(score_df.head(20), use_container_width=True)
+                st.write("### Bảng xếp hạng LONG realtime")
+
+                st.dataframe(
+                    score_df,
+                    use_container_width=True,
+                    height=500,
+                )
+
+                st.write("### Top 10 cơ hội LONG")
+
+                top10 = score_df.head(10)
+
+                st.dataframe(
+                    top10,
+                    use_container_width=True,
+                )
+
+                fig = px.bar(
+                    top10,
+                    x="ticker",
+                    y="long_probability",
+                    color="signal",
+                    title="Top xác suất LONG",
+                    labels={
+                        "ticker": "Mã",
+                        "long_probability": "Xác suất LONG",
+                    },
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
 
                 if selected_ticker in score_df["ticker"].values:
-                    one = score_df[score_df["ticker"] == selected_ticker].iloc[0]
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Mã đang chọn", one["ticker"])
-                    c2.metric("Xác suất LONG", f"{one['long_probability']:.2%}")
-                    c3.metric("Tín hiệu", one["signal"])
 
-# =========================================================
-# TAB 6 — STOCK EXPLORER
-# =========================================================
-with tab6:
-    st.subheader("Cổ phiếu chi tiết")
+                    one = score_df[
+                        score_df["ticker"] == selected_ticker
+                    ].iloc[0]
 
-    start_date_detail = st.date_input("Từ ngày", value=date_min.date(), key="start_detail")
-    end_date_detail = st.date_input("Đến ngày", value=date_max.date(), key="end_detail")
+                    c1, c2, c3, c4 = st.columns(4)
 
-    d = price_wide[[selected_ticker]].copy()
-    d = d.loc[pd.to_datetime(start_date_detail) : pd.to_datetime(end_date_detail)].dropna().reset_index()
-    d = d.rename(columns={selected_ticker: "close"}).sort_values("time")
+                    c1.metric(
+                        "Mã",
+                        one["ticker"],
+                    )
 
-    if d.empty:
-        st.warning("Không có dữ liệu trong khoảng ngày này.")
-    else:
-        d_overlay = make_price_overlay(d.rename(columns={"time": "date"}).copy())
+                    c2.metric(
+                        "Giá gần nhất",
+                        f"{one['close']:.2f}",
+                    )
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Giá đầu kỳ", f"{d['close'].iloc[0]:.2f}")
-        c2.metric("Giá cuối kỳ", f"{d['close'].iloc[-1]:.2f}")
-        c3.metric("Cao nhất", f"{d['close'].max():.2f}")
-        c4.metric("Thấp nhất", f"{d['close'].min():.2f}")
+                    c3.metric(
+                        "Xác suất LONG",
+                        f"{one['long_probability']:.2%}",
+                    )
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["close"], name="Giá", line=dict(width=2)))
-        fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["MA20"], name="MA20", line=dict(width=2)))
-        fig.add_trace(go.Scatter(x=d_overlay["date"], y=d_overlay["MA50"], name="MA50", line=dict(width=2)))
-
-        if show_overlay:
-            buy = d_overlay[d_overlay["BUY_overlay"]]
-            sell = d_overlay[d_overlay["SELL_overlay"]]
-
-            fig.add_trace(go.Scatter(
-                x=buy["date"],
-                y=buy["close"],
-                mode="markers",
-                name="BUY",
-                marker=dict(symbol="triangle-up", size=11),
-            ))
-            fig.add_trace(go.Scatter(
-                x=sell["date"],
-                y=sell["close"],
-                mode="markers",
-                name="SELL",
-                marker=dict(symbol="triangle-down", size=11),
-            ))
-
-        fig.update_layout(
-            height=700,
-            xaxis_title="Ngày",
-            yaxis_title="Giá",
-            xaxis_rangeslider_visible=True,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.write("### Bảng dữ liệu")
-        st.dataframe(d_overlay.sort_values("date", ascending=False), use_container_width=True)
-
-        st.write("### Thống kê nhanh")
-        daily_ret = d["close"].pct_change().fillna(0)
-        stats = pd.DataFrame(
-            {
-                "Chỉ tiêu": ["Lợi nhuận TB/ngày", "Biến động/ngày", "Tổng lợi nhuận", "Số phiên"],
-                "Giá trị": [
-                    f"{daily_ret.mean():.4%}",
-                    f"{daily_ret.std():.4%}",
-                    f"{(d['close'].iloc[-1] / d['close'].iloc[0] - 1):.2%}",
-                    f"{len(d):,}",
-                ],
-            }
-        )
-        st.dataframe(stats, use_container_width=True)
+                    c4.metric(
+                        "Tín hiệu",
+                        one["signal"],
+                    )
