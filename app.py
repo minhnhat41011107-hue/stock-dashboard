@@ -798,7 +798,8 @@ with st.spinner("Đang tải dữ liệu lõi..."):
     missing_required = check_required_files()
     if missing_required:
         st.error("Thiếu file bắt buộc:")
-        st.code("\n".join(missing_required))
+        st.code("
+".join(missing_required))
         st.stop()
 
     price_wide_base = load_price_wide()
@@ -909,10 +910,11 @@ if refresh_btn:
         tickers_to_update = tickers_to_update + ["VNINDEX"]
 
     progress = st.sidebar.progress(0)
-    updates = []
-    # clear cached history before refreshing
-    fetch_ohlc_history.clear()
-    fetch_latest_close_vnstock.clear()
+    updates = []    # clear cached history before refreshing
+    try:
+        fetch_ohlc_history.clear()
+    except Exception:
+        pass
 
     for i, tk in enumerate(tickers_to_update, start=1):
         rec = fetch_latest_close_vnstock(tk, source=active_source)
